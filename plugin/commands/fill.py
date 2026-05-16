@@ -20,6 +20,6 @@ def run(midi_path: str, prompt: str = None, style_context: str = None, output_di
         lines.append(f"    Chords: {' → '.join(r.get('chord_progression', []))}")
         lines.append("")
 
-    lines.append("Click → Piano Roll on any result to send it to FL Studio.")
+    lines.append("Select a result from the left panel, then click '→ Ghost Produce in FL Studio'.")
 
     return {"type": "files", "message": "\n".join(lines), "files": results, "analysis": analysis}

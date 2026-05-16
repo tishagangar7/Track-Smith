@@ -6,20 +6,41 @@ Layout:
   Right panel: Chat panel (slash commands)
 """
 
-import shutil
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QSplitter, QListWidget, QListWidgetItem,
-    QPushButton, QApplication, QMessageBox, QDialog,
-    QTextEdit, QDialogButtonBox,
+    QPushButton, QApplication, QMessageBox, QComboBox,
 )
-from PyQt6.QtCore import Qt, pyqtSlot
-from PyQt6.QtGui import QClipboard
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 
 from plugin.ui.midi_drop_zone import MidiDropZone
 from plugin.ui.chat_panel import ChatPanel
+from plugin.ui.player_panel import PlayerPanel
+from plugin import iac
+
+
+class _IACWorker(QThread):
+    done = pyqtSignal(str)   # emits the method used: "command" or "stream"
+    error = pyqtSignal(str)
+
+    def __init__(self, midi_path: str, port_name: str, use_fl_script: bool = True):
+        super().__init__()
+        self.midi_path = midi_path
+        self.port_name = port_name
+        self.use_fl_script = use_fl_script
+
+    def run(self):
+        try:
+            if self.use_fl_script:
+                path = iac.send_command(self.midi_path)
+                self.done.emit(f"command written → {path}")
+            else:
+                iac.send_to_iac(self.midi_path, self.port_name)
+                self.done.emit("streamed via IAC")
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class AuxApp(QMainWindow):
@@ -73,18 +94,35 @@ class AuxApp(QMainWindow):
 
         self.file_list = QListWidget()
         self.file_list.setWordWrap(True)
+        self.file_list.currentItemChanged.connect(self._on_file_selected)
         left_layout.addWidget(self.file_list, stretch=1)
 
-        fl_btn = QPushButton("→ Piano Roll")
-        fl_btn.setObjectName("fl_btn")
-        fl_btn.setToolTip("Write selected file as pending.mid for FL Studio Script Pad")
-        fl_btn.clicked.connect(self._send_selected_to_fl)
-        left_layout.addWidget(fl_btn)
+        self.player = PlayerPanel()
+        left_layout.addWidget(self.player)
 
-        setup_btn = QPushButton("FL Script Setup")
-        setup_btn.setObjectName("secondary")
-        setup_btn.clicked.connect(self._show_fl_script)
-        left_layout.addWidget(setup_btn)
+        self.port_selector = QComboBox()
+        ports = iac.list_ports()
+        if ports:
+            self.port_selector.addItems(ports)
+            if iac.DEFAULT_PORT in ports:
+                self.port_selector.setCurrentText(iac.DEFAULT_PORT)
+        else:
+            self.port_selector.addItem("No IAC ports found")
+            self.port_selector.setEnabled(False)
+        left_layout.addWidget(self.port_selector)
+
+        self.fl_script_toggle = QComboBox()
+        self.fl_script_toggle.addItem("Ghost produce (FL script)", True)
+        self.fl_script_toggle.addItem("Raw stream (IAC fallback)", False)
+        left_layout.addWidget(self.fl_script_toggle)
+
+        self.fl_btn = QPushButton("→ Ghost Produce in FL Studio")
+        self.fl_btn.setObjectName("fl_btn")
+        self.fl_btn.setToolTip("Send 4-bar pattern to FL Studio via MIDI Controller Script")
+        self.fl_btn.clicked.connect(self._send_selected_to_fl)
+        left_layout.addWidget(self.fl_btn)
+
+        self._iac_worker: _IACWorker | None = None
 
         splitter.addWidget(left)
 
@@ -106,6 +144,34 @@ class AuxApp(QMainWindow):
     @pyqtSlot(str)
     def _on_midi_loaded(self, path: str):
         self.chat.set_midi_path(path)
+        self._warn_if_empty(path)
+
+    def _warn_if_empty(self, path: str):
+        try:
+            import mido
+            mid = mido.MidiFile(path)
+            notes = [
+                m for track in mid.tracks
+                for m in track
+                if m.type in ("note_on", "note_off")
+            ]
+            if not notes:
+                self.chat._append_system(
+                    "Warning: this MIDI file has no notes — /fill and /analyze will use defaults.\n"
+                    "Export a MIDI with actual notes from FL Studio, or use /vibe to generate from scratch."
+                )
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def _on_file_selected(self):
+        item = self.file_list.currentItem()
+        if not item:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and Path(path).exists():
+            bpm = item.data(Qt.ItemDataRole.UserRole + 1) or 120.0
+            self.player.load(path, original_bpm=float(bpm))
 
     @pyqtSlot(list, str)
     def _on_files_ready(self, files: list, output_dir: str):
@@ -113,8 +179,10 @@ class AuxApp(QMainWindow):
         for f in files:
             filepath = f.get("filepath", "")
             label = f.get("vibe") or f.get("description") or Path(filepath).name
-            item = QListWidgetItem(f"{label}\n{Path(filepath).name}")
+            bpm   = f.get("tempo", 120)
+            item  = QListWidgetItem(f"{label}\n{Path(filepath).name}")
             item.setData(Qt.ItemDataRole.UserRole, filepath)
+            item.setData(Qt.ItemDataRole.UserRole + 1, bpm)
             self.file_list.addItem(item)
 
         if files:
@@ -129,104 +197,27 @@ class AuxApp(QMainWindow):
         if not src or not Path(src).exists():
             QMessageBox.warning(self, "File not found", f"Cannot find:\n{src}")
             return
+        if self._iac_worker and self._iac_worker.isRunning():
+            QMessageBox.information(self, "Busy", "Already streaming — wait for it to finish.")
+            return
 
-        pending = Path(self.output_dir) / "pending.mid"
-        shutil.copy2(src, pending)
+        port_name = self.port_selector.currentText()
+        use_fl_script = self.fl_script_toggle.currentData()
+        self._iac_worker = _IACWorker(src, port_name, use_fl_script=use_fl_script)
+        self._iac_worker.done.connect(self._on_iac_done)
+        self._iac_worker.error.connect(self._on_iac_error)
+        self._iac_worker.finished.connect(lambda: self._set_fl_btn_busy(False))
+        self._iac_worker.start()
+        self._set_fl_btn_busy(True)
 
-        QMessageBox.information(
-            self,
-            "Ready for FL Studio",
-            f"Written to:\n{pending}\n\n"
-            "In FL Studio:\n"
-            "  1. Open a pattern in the piano roll\n"
-            "  2. Open Script Pad (Tools → Script → Score)\n"
-            "  3. Paste aux_import.py (click 'FL Script Setup' to copy)\n"
-            "  4. Click Run — notes will appear in the piano roll",
-        )
+    def _set_fl_btn_busy(self, busy: bool):
+        self.fl_btn.setEnabled(not busy)
+        self.fl_btn.setText("Writing command..." if busy else "→ Ghost Produce in FL Studio")
 
-    def _show_fl_script(self):
-        pending_path = (Path(self.output_dir) / "pending.mid").resolve()
-        script_path = Path(__file__).parent / "fl_script" / "aux_import.py"
-        template = script_path.read_text() if script_path.exists() else _FL_SCRIPT_FALLBACK
+    def _on_iac_done(self, method: str):
+        self.chat._append_system(f"Sent to FL Studio ({method}).")
 
-        filled = template.replace(
-            'PENDING_MID = r"<UPDATE_THIS_PATH>"',
-            f'PENDING_MID = r"{pending_path}"',
-        )
-
-        dlg = _ScriptDialog(filled, self)
-        dlg.exec()
+    def _on_iac_error(self, err: str):
+        QMessageBox.warning(self, "FL Studio Error", f"Failed to send:\n{err}")
 
 
-class _ScriptDialog(QDialog):
-    def __init__(self, script: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("FL Studio Script Pad — aux_import.py")
-        self.resize(620, 440)
-        layout = QVBoxLayout(self)
-
-        note = QLabel(
-            "Copy this script into FL Studio's Script Pad\n"
-            "(Tools → Script → Score  or  Alt+Shift+S)"
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        self.editor = QTextEdit()
-        self.editor.setPlainText(script)
-        self.editor.setReadOnly(True)
-        layout.addWidget(self.editor)
-
-        btns = QDialogButtonBox()
-        copy_btn = QPushButton("Copy to Clipboard")
-        copy_btn.clicked.connect(self._copy)
-        btns.addButton(copy_btn, QDialogButtonBox.ButtonRole.ActionRole)
-        close_btn = btns.addButton(QDialogButtonBox.StandardButton.Close)
-        close_btn.clicked.connect(self.accept)
-        layout.addWidget(btns)
-
-    def _copy(self):
-        QApplication.clipboard().setText(self.editor.toPlainText())
-
-
-_FL_SCRIPT_FALLBACK = '''\
-import flp
-import os
-
-# UPDATE THIS PATH to match your machine
-PENDING_MID = r"<UPDATE_THIS_PATH>"
-
-if not os.path.exists(PENDING_MID):
-    raise FileNotFoundError(f"pending.mid not found at: {PENDING_MID}")
-
-try:
-    import mido
-except ImportError:
-    raise ImportError("mido not installed in FL Studio's Python. Run: pip install mido")
-
-mid = mido.MidiFile(PENDING_MID)
-ticks_per_beat = mid.ticks_per_beat
-ppq = flp.score.PPQ
-
-flp.score.clear(True)
-
-for track in mid.tracks:
-    tick = 0
-    active = {}
-    for msg in track:
-        tick += msg.time
-        fl_tick = int(tick * ppq / ticks_per_beat)
-        if msg.type == "note_on" and msg.velocity > 0:
-            active[msg.note] = (fl_tick, msg.velocity)
-        elif msg.type in ("note_off", "note_on") and msg.note in active:
-            start, vel = active.pop(msg.note)
-            length = max(1, fl_tick - start)
-            n = flp.Note()
-            n.number = msg.note
-            n.time = start
-            n.length = length
-            n.velocity = round(vel / 127, 3)
-            flp.score.addNote(n)
-
-os.remove(PENDING_MID)
-'''
