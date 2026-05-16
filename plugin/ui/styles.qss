@@ -232,10 +232,10 @@ QLabel#agent_dot_on {
 QLabel#drop_zone {
     background-color: transparent;
     border: 1.5px dashed rgba(255,240,210,0.18);
-    border-radius: 12px;
-    color: rgba(244,237,225,0.34);
-    font-size: 13px;
-    padding: 24px;
+    border-radius: 10px;
+    color: rgba(244,237,225,0.58);
+    font-size: 12px;
+    padding: 4px 16px;
     qproperty-alignment: AlignCenter;
 }
 

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame,
-    QLineEdit, QPushButton, QLabel, QSizePolicy,
+    QLineEdit, QPushButton, QLabel, QSizePolicy, QSlider,
 )
 from PyQt6.QtCore import Qt, QThread, QUrl, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import (
@@ -343,6 +343,7 @@ class _InferenceWorker(QThread):
 
 class ChatPanel(QWidget):
     files_ready = pyqtSignal(list, str)   # (files list, output_dir)
+    command_started = pyqtSignal(str)     # emits the slash command e.g. "/fill"
 
     def __init__(self, output_dir: str, parent=None):
         super().__init__(parent)
@@ -466,6 +467,23 @@ class ChatPanel(QWidget):
         hdr.addWidget(self._lbl_audio)
         av.addLayout(hdr)
 
+        # Seek slider + time label
+        seek_row = QHBoxLayout()
+        seek_row.setSpacing(8)
+        self._audio_seek = QSlider(Qt.Orientation.Horizontal)
+        self._audio_seek.setRange(0, 1000)
+        self._audio_seek.setValue(0)
+        self._audio_seek.setFixedHeight(14)
+        self._audio_seek.sliderMoved.connect(self._on_audio_seek)
+        seek_row.addWidget(self._audio_seek, stretch=1)
+        self._audio_time = QLabel("0:00")
+        self._audio_time.setStyleSheet(
+            "color:rgba(244,237,225,0.34); font-size:10px; background:transparent; border:none;"
+        )
+        self._audio_time.setFixedWidth(36)
+        seek_row.addWidget(self._audio_time)
+        av.addLayout(seek_row)
+
         # Button row — all controls clearly visible
         btns = QHBoxLayout()
         btns.setSpacing(8)
@@ -554,8 +572,12 @@ class ChatPanel(QWidget):
         self._audio_bar.setVisible(True)
         self._lbl_audio.setText(Path(audio_path).name)
         self._btn_play.setText("▶ Play")
+        self._audio_seek.setValue(0)
+        self._audio_time.setText("0:00")
 
         if self._player:
+            self._player.positionChanged.connect(self._on_player_position)
+            self._player.durationChanged.connect(self._on_player_duration)
             self._player.setSource(QUrl.fromLocalFile(audio_path))
 
         if not _HAS_MEDIA:
@@ -586,6 +608,24 @@ class ChatPanel(QWidget):
                 self._btn_play.setText("⏸ Pause")
         else:
             _open_with_system(self._latest_audio)
+
+    def _on_player_position(self, pos_ms: int):
+        if not self._player:
+            return
+        dur = self._player.duration()
+        if dur > 0 and not self._audio_seek.isSliderDown():
+            self._audio_seek.setValue(int(pos_ms * 1000 / dur))
+        s = pos_ms // 1000
+        self._audio_time.setText(f"{s // 60}:{s % 60:02d}")
+
+    def _on_player_duration(self, dur_ms: int):
+        self._audio_seek.setValue(0)
+
+    def _on_audio_seek(self, value: int):
+        if self._player:
+            dur = self._player.duration()
+            if dur > 0:
+                self._player.setPosition(int(value * dur / 1000))
 
     def _open_audio_folder(self):
         target = self._latest_audio or (self.output_dir if self.output_dir else None)
@@ -648,6 +688,10 @@ class ChatPanel(QWidget):
 
     def _dispatch(self, raw: str):
         from plugin.commands.router import route
+        # Emit the slash command word so the transport can highlight it
+        first = raw.strip().split()[0].lower() if raw.strip() else ""
+        if first.startswith("/"):
+            self.command_started.emit(first)
         self._set_busy(True)
         self._append_system("thinking...")
         self._worker = _InferenceWorker(

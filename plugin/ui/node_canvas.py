@@ -244,7 +244,7 @@ class NodeCanvas(QWidget):
     """Right panel: transport + dot-grid canvas with MIDI blocks + FL export."""
 
     file_selected = pyqtSignal(str, float)   # path, bpm
-    mode_changed = pyqtSignal(str)           # "input_only" | "combined" | "continuation_only"
+    command_triggered = pyqtSignal(str)      # slash command string e.g. "/fill"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -315,22 +315,24 @@ class NodeCanvas(QWidget):
         div.setStyleSheet("background: rgba(255,240,210,0.09);")
         row.addWidget(div)
 
-        # Playback mode buttons — Original / With Fill / Fill Only
-        _MODE_IDS = [
-            ("original", "input_only"),
-            ("with fill", "combined"),
-            ("fill only", "continuation_only"),
-        ]
-        self._mode_tabs: list[QPushButton] = []
-        self._mode_values = [m for _, m in _MODE_IDS]
-        for i, (label, _) in enumerate(_MODE_IDS):
-            btn = QPushButton(label)
-            btn.setObjectName("view_tab_active" if i == 1 else "view_tab")
+        # Command shortcut buttons — slash commands with per-command colors
+        _CMD_COLORS = {
+            "/fill":    "#f5c9a0",
+            "/mix":     "#a8cfc5",
+            "/style":   "#d8b8eb",
+            "/analyze": "#c3d9a0",
+            "/vibe":    "#f0b3cc",
+        }
+        self._cmd_tabs: list[QPushButton] = []
+        self._cmd_colors: dict[str, str] = _CMD_COLORS
+        self._active_cmd: str = ""
+        for cmd, clr in _CMD_COLORS.items():
+            btn = QPushButton(cmd)
             btn.setCheckable(True)
-            btn.setChecked(i == 1)
-            btn.clicked.connect(lambda _, idx=i: self._switch_mode(idx))
+            btn.setStyleSheet(self._cmd_style(cmd, clr, active=False))
+            btn.clicked.connect(lambda _, c=cmd: self._trigger_command(c))
             row.addWidget(btn)
-            self._mode_tabs.append(btn)
+            self._cmd_tabs.append(btn)
 
         # Divider before zoom
         div2 = QLabel()
@@ -353,14 +355,31 @@ class NodeCanvas(QWidget):
 
         return bar
 
-    def _switch_mode(self, idx: int):
-        for i, btn in enumerate(self._mode_tabs):
-            active = i == idx
-            btn.setObjectName("view_tab_active" if active else "view_tab")
-            btn.setChecked(active)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-        self.mode_changed.emit(self._mode_values[idx])
+    @staticmethod
+    def _cmd_style(cmd: str, clr: str, active: bool) -> str:
+        if active:
+            return (
+                f"QPushButton {{ background:{clr}; color:#0f0d0b; border:none;"
+                f" border-radius:6px; padding:5px 10px; font-size:11px; font-weight:600; }}"
+            )
+        return (
+            f"QPushButton {{ background:transparent; color:{clr};"
+            f" border:1px solid {clr}; border-radius:6px;"
+            f" padding:5px 10px; font-size:11px; }}"
+            f"QPushButton:hover {{ background:{clr}22; }}"
+        )
+
+    def _trigger_command(self, cmd: str):
+        self.set_active_command(cmd)
+        self.command_triggered.emit(cmd)
+
+    def set_active_command(self, cmd: str):
+        self._active_cmd = cmd
+        for btn in self._cmd_tabs:
+            c = btn.text()
+            clr = self._cmd_colors.get(c, "#e8a268")
+            btn.setStyleSheet(self._cmd_style(c, clr, active=(c == cmd)))
+            btn.setChecked(c == cmd)
 
     def _zoom_in(self):
         self._canvas.set_zoom(min(2.0, self._canvas._zoom + 0.2))

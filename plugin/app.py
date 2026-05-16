@@ -120,7 +120,8 @@ class TrackSmithApp(QMainWindow):
         # Node canvas (transport bar + dot-grid blocks)
         self.canvas = NodeCanvas()
         self.canvas.file_selected.connect(self._on_canvas_file_selected)
-        self.canvas.mode_changed.connect(self._on_canvas_mode_changed)
+        self.canvas.command_triggered.connect(self._on_canvas_command)
+        self.chat.command_started.connect(self.canvas.set_active_command)
         right_layout.addWidget(self.canvas, stretch=1)
 
         # Audio preview panel (built in ChatPanel, displayed here)
@@ -238,11 +239,9 @@ class TrackSmithApp(QMainWindow):
             self.canvas.set_time("0:00", f"{mins}:{secs:02d}" if mins else f"0:{int(dur):02d}")
 
     @pyqtSlot(str)
-    def _on_canvas_mode_changed(self, mode: str):
-        mode_map = {"input_only": 0, "combined": 1, "continuation_only": 2}
-        btn_id = mode_map.get(mode, 1)
-        self.player._mode_group.button(btn_id).setChecked(True)
-        self.player._on_mode_group(btn_id)
+    def _on_canvas_command(self, cmd: str):
+        self.chat.input.setText(cmd)
+        self.chat.send()
 
     @pyqtSlot(str, float)
     def _on_canvas_file_selected(self, path: str, bpm: float):
@@ -267,7 +266,7 @@ class TrackSmithApp(QMainWindow):
     def _update_download_buttons(self):
         has_cont = bool(self.player._continuation_path)
         self.dl_fill_btn.setEnabled(has_cont)
-        can_merge = has_cont and self._input_path and self._input_type == "midi"
+        can_merge = bool(has_cont and self._input_path and self._input_type == "midi")
         self.dl_merged_btn.setEnabled(can_merge)
 
     def _download_fill(self):
