@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, QUrl, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import (
-    QKeyEvent, QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
+    QKeyEvent, QPainter, QPainterPath, QPen, QBrush, QColor, QFont, QFontMetrics,
 )
 
 try:
@@ -287,6 +287,80 @@ class _ErrorMsg(QWidget):
             "color:#f08080; font-size:13px;"
         )
         l.addWidget(bubble)
+
+
+class _WaveWidget(QWidget):
+    """Animated 3-layer sine wave — replaces static 'thinking...' during inference."""
+
+    _LAYERS = [
+        (12,  0.020, 0.0, 0.30),
+        (8,   0.030, 1.0, 0.50),
+        (15,  0.015, 2.0, 0.80),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(60)
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(50)
+
+    def _tick(self):
+        self._phase += 0.12
+        self.update()
+
+    def stop(self):
+        self._timer.stop()
+
+    def paintEvent(self, event):
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            w = self.width()
+            cy = self.height() / 2.0
+            for amp, freq, phase_off, opacity in self._LAYERS:
+                color = QColor("#00d4aa")
+                color.setAlphaF(opacity)
+                p.setPen(QPen(color, 1.5))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                path = QPainterPath()
+                path.moveTo(0.0, cy + amp * math.sin(self._phase + phase_off))
+                for x in range(1, w):
+                    y = cy + amp * math.sin(freq * x + self._phase + phase_off)
+                    path.lineTo(float(x), y)
+                p.drawPath(path)
+            p.end()
+        except Exception:
+            pass
+
+
+class _PolicyLogMsg(QWidget):
+    """Compact OpenClaw policy activity strip shown after /fill completes."""
+
+    def __init__(self, entries: list, parent=None):
+        super().__init__(parent)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(0, 6, 0, 2)
+        l.setSpacing(2)
+
+        hdr = QLabel("Agent Activity")
+        hdr.setStyleSheet(
+            "color:rgba(244,237,225,0.22); font-size:10px; font-weight:500;"
+            "letter-spacing:0.5px; background:transparent; border:none;"
+        )
+        l.addWidget(hdr)
+
+        for e in entries:
+            icon = "✅" if e.get("status") == "allowed" else "🚫"
+            detail = f" · {e['detail']}" if e.get("detail") else ""
+            row = QLabel(f"{icon}  {e.get('action', '')} → {e.get('resource', '')}{detail}")
+            row.setStyleSheet(
+                "color:rgba(244,237,225,0.32); font-size:10px;"
+                "background:transparent; border:none;"
+            )
+            row.setWordWrap(True)
+            l.addWidget(row)
 
 
 class _ChatLog(QScrollArea):
@@ -693,7 +767,12 @@ class ChatPanel(QWidget):
         if first.startswith("/"):
             self.command_started.emit(first)
         self._set_busy(True)
-        self._append_system("thinking...")
+        try:
+            wave = _WaveWidget()
+            self._chat_log.add_widget(wave)
+            self._thinking_widget = wave
+        except Exception:
+            self._append_system("processing...")
         self._worker = _InferenceWorker(
             route, raw, self._midi_path, self._style_context, self.output_dir,
         )
@@ -729,6 +808,7 @@ class ChatPanel(QWidget):
             )
             if files:
                 self.files_ready.emit(files, self.output_dir)
+            self._append_policy_log()
         elif rtype == "stems":
             self._append_agent(msg)
             stems_dir = result.get("stems_dir", "")
@@ -766,8 +846,19 @@ class ChatPanel(QWidget):
     def _append_error(self, text: str):
         self._chat_log.add_widget(_ErrorMsg(text))
 
+    def _append_policy_log(self):
+        try:
+            from agent.openclaw_client import openclaw
+            entries = openclaw.get_recent_log(5)
+            if entries:
+                self._chat_log.add_widget(_PolicyLogMsg(entries))
+        except Exception:
+            pass
+
     def _remove_thinking(self):
         if self._thinking_widget:
+            if hasattr(self._thinking_widget, "stop"):
+                self._thinking_widget.stop()
             self._chat_log.remove_widget(self._thinking_widget)
             self._thinking_widget = None
 

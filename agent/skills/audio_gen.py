@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 
 from agent.config import AUDIO_DURATION, AUDIO_SERVER_URL
+from agent.openclaw_client import openclaw
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,7 @@ def generate_audio_continuation(
     else:
         logger.info("[MusicGen] text-only  prompt=%r  duration=%ds", mg_prompt, dur)
 
+    openclaw.log_action("network.call", "100.77.70.20:8001", "allowed", "MusicGen audio generation")
     try:
         resp = httpx.post(
             f"{AUDIO_SERVER_URL}/generate",
@@ -198,6 +200,7 @@ def separate_stems(audio_path: str, output_dir: str) -> dict[str, str]:
         raise AudioServerOfflineError("AUDIO_SERVER_URL not configured")
 
     logger.info("[demucs] separating %s", Path(audio_path).name)
+    openclaw.log_action("network.call", "100.77.70.20:8001", "allowed", "Demucs stem separation")
 
     try:
         with open(audio_path, "rb") as f:
