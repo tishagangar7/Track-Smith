@@ -95,11 +95,13 @@ QPushButton#transport_btn_play {
     background-color: #e8a268;
     color: #1a0e06;
     border: none;
-    border-radius: 999px;
-    width: 48px;
-    height: 48px;
+    border-radius: 8px;
+    min-width: 94px;
+    max-width: 94px;
+    min-height: 34px;
+    max-height: 34px;
     padding: 0;
-    font-size: 16px;
+    font-size: 13px;
     font-weight: 700;
 }
 

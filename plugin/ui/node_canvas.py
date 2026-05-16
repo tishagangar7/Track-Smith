@@ -84,11 +84,16 @@ class _NodeCard(QWidget):
         self._color = color
         self._idx = idx
         self._selected = False
+        self._scale_hint = 1.0
         self.setFixedSize(_CARD_W, _CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_selected(self, sel: bool):
         self._selected = sel
+        self.update()
+
+    def set_scale_hint(self, scale: float):
+        self._scale_hint = scale
         self.update()
 
     def mousePressEvent(self, event):
@@ -105,7 +110,7 @@ class _NodeCard(QWidget):
         path.addRoundedRect(0.5, 0.5, W - 1, H - 1, 12, 12)
         p.fillPath(path, QBrush(_NODE_BG))
         border = _AMBER if self._selected else _LINE
-        p.setPen(QPen(border, 1.5 if self._selected else 1.0))
+        p.setPen(QPen(border, 2.0 if self._selected else 1.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
 
@@ -182,7 +187,8 @@ class _DotCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._cards: list[_NodeCard] = []
-        self._zoom: float = 0.75  # default fits all 3 cards
+        self._selected_idx: int = 0
+        self._zoom: float = 1.0
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_zoom(self, zoom: float):
@@ -190,12 +196,38 @@ class _DotCanvas(QWidget):
         self._reposition_cards()
         self.update()
 
+    def set_selected_idx(self, idx: int):
+        self._selected_idx = idx
+        self._reposition_cards()
+        self.update()
+
+    def _layout_specs(self) -> list[tuple[int, int, int, int]]:
+        specs: list[tuple[int, int, int, int]] = []
+        for i in range(len(self._cards)):
+            x, y = (_CARD_POSITIONS[i] if i < len(_CARD_POSITIONS) else (60 + i * 260, 90))
+            specs.append((x, y, _CARD_W, _CARD_H))
+        return specs
+
     def _reposition_cards(self):
-        z = self._zoom
+        if not self._cards:
+            return
+
+        specs = self._layout_specs()
+        margin_x, margin_y = 28, 28
+        content_w = max(1, max(x + w for x, y, w, h in specs))
+        content_h = max(1, max(y + h for x, y, w, h in specs))
+        fit = min(
+            1.0,
+            max(0.56, (self.width() - margin_x * 2) / content_w),
+            max(0.56, (self.height() - margin_y * 2) / content_h),
+        )
+        z = self._zoom * fit
+
         for i, card in enumerate(self._cards):
-            px, py = (_CARD_POSITIONS[i] if i < len(_CARD_POSITIONS) else (60 + i * 260, 90))
-            card.move(int(px * z), int(py * z))
-            card.setFixedSize(int(_CARD_W * z), int(_CARD_H * z))
+            px, py, w, h = specs[i]
+            card.move(int(margin_x + px * z), int(margin_y + py * z))
+            card.setFixedSize(max(120, int(w * z)), max(72, int(h * z)))
+            card.set_scale_hint(z)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -214,10 +246,8 @@ class _DotCanvas(QWidget):
             edge_pen = QPen(QColor(255, 240, 210, 46), 1.5)
             p.setPen(edge_pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            cw = int(_CARD_W * self._zoom)
-            ch = int(_CARD_H * self._zoom)
             centers = [
-                QPoint(c.x() + cw // 2, c.y() + ch // 2)
+                QPoint(c.x() + c.width() // 2, c.y() + c.height() // 2)
                 for c in self._cards
             ]
             pairs = [(0, 1), (1, 2)] if len(centers) >= 3 else [(0, 1)]
@@ -237,7 +267,12 @@ class _DotCanvas(QWidget):
 
     def set_cards(self, cards: list[_NodeCard]):
         self._cards = cards
+        self._reposition_cards()
         self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_cards()
 
 
 class NodeCanvas(QWidget):
@@ -271,24 +306,24 @@ class NodeCanvas(QWidget):
     def _make_transport(self) -> QWidget:
         bar = QWidget()
         bar.setObjectName("transport_bar")
-        bar.setFixedHeight(64)
+        bar.setFixedHeight(50)
         row = QHBoxLayout(bar)
-        row.setContentsMargins(20, 0, 20, 0)
+        row.setContentsMargins(14, 0, 14, 0)
         row.setSpacing(8)
 
-        self._btn_play = QPushButton("▶")
+        self._btn_play = QPushButton("▶ Play")
         self._btn_play.setObjectName("transport_btn_play")
-        self._btn_play.setFixedSize(48, 48)
+        self._btn_play.setFixedSize(94, 34)
         row.addWidget(self._btn_play)
 
         self._btn_stop = QPushButton("◼")
         self._btn_stop.setObjectName("transport_btn")
-        self._btn_stop.setFixedSize(32, 32)
+        self._btn_stop.setFixedSize(30, 30)
         row.addWidget(self._btn_stop)
 
         self._btn_loop = QPushButton("↻")
         self._btn_loop.setObjectName("transport_btn")
-        self._btn_loop.setFixedSize(32, 32)
+        self._btn_loop.setFixedSize(30, 30)
         row.addWidget(self._btn_loop)
 
         self._spinner = VinylSpinner(size=18)
@@ -449,6 +484,7 @@ class NodeCanvas(QWidget):
 
     def _select(self, idx: int):
         self._selected_idx = idx
+        self._canvas.set_selected_idx(idx)
         for i, card in enumerate(self._cards):
             card.set_selected(i == idx)
         if idx < len(self._files):
