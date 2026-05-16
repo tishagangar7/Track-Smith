@@ -1,6 +1,9 @@
+import logging
 from pathlib import Path
 
 from agent.config import AUDIO_SERVER_URL, AUDIO_DURATION
+
+logger = logging.getLogger(__name__)
 from agent.skills.audio_gen import AudioServerOfflineError, _AUDIO_EXTS, generate_audio_continuation
 from agent.skills.continuation_gen import generate_continuations
 from agent.skills.input_analyzer import analyze_input, validate_input_for_generation
@@ -32,7 +35,8 @@ def run(midi_path: str, prompt: str = None, style_context: str = None, output_di
                 original_audio_path=ref_audio,
             )
             audio_note = f"\nAudio continuation: {Path(audio_path).name} (▶ Play above)"
-        except AudioServerOfflineError:
+        except AudioServerOfflineError as e:
+            logger.error("Audio generation failed: %s — falling back to MIDI", e)
             audio_note = "\n(Audio server offline — MIDI only)"
 
     # MIDI generation always runs as primary / fallback

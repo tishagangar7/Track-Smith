@@ -18,22 +18,61 @@ class AudioServerOfflineError(Exception):
     pass
 
 
+# Keyword → producer-grade descriptor. Checked in order; multiple can match.
+_STYLE_MAP: list[tuple[set[str], str]] = [
+    ({"trap", "drill"},         "trap drums, 808 sub bass, triplet hi-hats"),
+    ({"808"},                   "heavy 808 sub bass, trap drums"),
+    ({"lo-fi", "lofi", "lo fi"}, "lo-fi hip hop, jazzy piano, dusty drums, vinyl warmth"),
+    ({"dark"},                  "dark, moody, minor key atmosphere"),
+    ({"drake", "melodic"},      "melodic, emotional, atmospheric pads, vocal chops"),
+    ({"jazz", "jazzy"},         "jazz piano, walking bass, brushed drums"),
+    ({"house", "dance"},        "four-on-the-floor kick, punchy synth bass, dance music"),
+    ({"ambient", "atmospheric"}, "ambient textural pads, reverb wash, slow attack"),
+    ({"r&b", "rnb", "soul"},    "R&B, soulful smooth chords, vocal chops"),
+    ({"rage", "pluggnb"},       "pluggnb, icy bells, heavy bass, Atlanta"),
+    ({"boom bap", "boom-bap"},  "boom bap, sampled drums, punchy snare, NYC hip hop"),
+]
+
+_ENERGY_DESCRIPTORS = {
+    "high":  "hard-hitting, high energy",
+    "mid":   "mid-tempo, groovy",
+    "low":   "mellow, soft, introspective",
+}
+
+
 def build_musicgen_prompt(analysis: dict, prompt: str | None = None) -> str:
     key = analysis.get("key", "C major")
-    tempo = analysis.get("tempo", 120)
+    tempo = int(analysis.get("tempo") or 120)
     energy = analysis.get("energy", 0.5)
-    chords = " ".join((analysis.get("chord_progression") or [])[:4])
 
+    # Energy tier
     if energy > 0.7:
-        energy_word = "energetic"
+        energy_desc = _ENERGY_DESCRIPTORS["high"]
     elif energy < 0.3:
-        energy_word = "calm"
+        energy_desc = _ENERGY_DESCRIPTORS["low"]
     else:
-        energy_word = "groovy"
+        energy_desc = _ENERGY_DESCRIPTORS["mid"]
 
-    parts = [f"{energy_word} music in {key} at {tempo} BPM"]
-    if chords:
-        parts.append(f"chord progression: {chords}")
+    # Match style keywords against prompt (case-insensitive)
+    raw = (prompt or "").lower()
+    genre_tags: list[str] = []
+    for keywords, descriptor in _STYLE_MAP:
+        if any(kw in raw for kw in keywords):
+            genre_tags.append(descriptor)
+
+    parts: list[str] = []
+
+    if genre_tags:
+        parts.extend(genre_tags)
+        parts.append(energy_desc)
+    else:
+        # No keywords — lead with energy + generic beat descriptor
+        parts.append(f"{energy_desc} beat")
+
+    parts.append(key)
+    parts.append(f"{tempo} BPM")
+
+    # Append any free-text from the user verbatim at the end
     if prompt:
         parts.append(prompt)
 
@@ -72,7 +111,7 @@ def generate_audio_continuation(
         resp = httpx.post(
             f"{AUDIO_SERVER_URL}/generate",
             json=body,
-            timeout=120.0,
+            timeout=300.0,
         )
         resp.raise_for_status()
     except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
