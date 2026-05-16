@@ -18,7 +18,7 @@ class MediaDropZone(QLabel):
         self.setAcceptDrops(True)
         self.setText("Drop MIDI / MP3 here\nor click to browse")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumHeight(90)
+        self.setMinimumHeight(44)
         self._path: str | None = None
         self._source_type: str = "midi"
 

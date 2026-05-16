@@ -17,7 +17,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -26,19 +25,29 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Aux Audio Server", version="1.0.0")
 
+_MUSICGEN_SAMPLE_RATE = 32000
+
 _musicgen = None
 _processor = None
+_is_melody_model = False
 
 
 def _load_musicgen():
-    global _musicgen, _processor
+    global _musicgen, _processor, _is_melody_model
     if _musicgen is None:
-        from transformers import AutoProcessor, MusicgenForConditionalGeneration
-        model_name = os.getenv("MODEL_NAME", "facebook/musicgen-small")
+        from transformers import AutoProcessor
+        model_name = os.getenv("MUSICGEN_MODEL", "facebook/musicgen-small")
+        _is_melody_model = "melody" in model_name
         _processor = AutoProcessor.from_pretrained(model_name)
-        _musicgen = MusicgenForConditionalGeneration.from_pretrained(model_name)
+        if _is_melody_model:
+            from transformers import MusicgenMelodyForConditionalGeneration
+            _musicgen = MusicgenMelodyForConditionalGeneration.from_pretrained(model_name)
+        else:
+            from transformers import MusicgenForConditionalGeneration
+            _musicgen = MusicgenForConditionalGeneration.from_pretrained(model_name)
         if torch.cuda.is_available():
             _musicgen = _musicgen.cuda()
+        logger.info("Loaded %s (melody_conditioning=%s)", model_name, _is_melody_model)
     return _musicgen, _processor
 
 
@@ -60,29 +69,47 @@ def generate(req: GenerateRequest):
 
         model, processor = _load_musicgen()
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        max_new_tokens = req.duration * 50  # ~50 tokens/sec
 
-        inputs = processor(
-            text=[req.prompt],
-            padding=True,
-            return_tensors="pt",
-        ).to(device)
+        if req.reference_audio_b64 and _is_melody_model:
+            import base64
+            import librosa
+            raw_bytes = base64.b64decode(req.reference_audio_b64)
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                # librosa handles any format (mp3/wav/flac) via soundfile/ffmpeg
+                audio_np, _ = librosa.load(tmp_path, sr=_MUSICGEN_SAMPLE_RATE, mono=True)
+            finally:
+                os.unlink(tmp_path)
+            inputs = processor(
+                audio=[audio_np],
+                sampling_rate=_MUSICGEN_SAMPLE_RATE,
+                text=[req.prompt],
+                padding=True,
+                return_tensors="pt",
+            ).to(device)
+        else:
+            inputs = processor(
+                text=[req.prompt],
+                padding=True,
+                return_tensors="pt",
+            ).to(device)
 
-        max_new_tokens = int(os.getenv("AUDIO_MAX_TOKENS", "1024"))
         with torch.no_grad():
             audio_values = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-        audio = audio_values[0, 0].cpu().numpy().astype(np.float32)
-        if np.abs(audio).max() > 0:
-            audio = audio / np.abs(audio).max()
-        audio_int16 = (audio * 32767).astype(np.int16)
-
+        audio_np = audio_values[0, 0].cpu().numpy()
         sample_rate = model.config.audio_encoder.sampling_rate
+
         buf = io.BytesIO()
-        wav.write(buf, sample_rate, audio_int16)
+        wav.write(buf, sample_rate, (audio_np * 32767).astype("int16"))
         buf.seek(0)
 
         return Response(content=buf.read(), media_type="audio/wav")
     except Exception as e:
+        logger.error("Generate error: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 

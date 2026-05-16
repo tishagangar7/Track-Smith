@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "muzaic": {
+      "command": "uvx",
+      "args": ["muzaic-mcp"],
+      "env": {
+        "MUZAIC_API_KEY": "your-key-from-muzaic.com"
+      }
+    },
+    "aimusic": {
+      "command": "uvx",
+      "args": ["aimusic-mcp"],
+      "env": {
+        "AIMUSIC_API_KEY": "your-key"
+      }
+    }
+  }
+}
