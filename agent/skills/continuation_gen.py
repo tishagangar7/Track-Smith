@@ -7,15 +7,18 @@ Step 2: Generates real MIDI files for each direction
 import os
 import json
 import logging
-import requests
 import numpy as np
 import pretty_midi
 from pathlib import Path
 from typing import Union
 
-from agent.config import (
-    NVIDIA_API_KEY, NVIDIA_BASE_URL, NEMOTRON_MODEL,
-    NEMOTRON_TIMEOUT, NEMOTRON_MAX_TOKENS, NEMOTRON_TEMPERATURE
+from agent.config import NEMOTRON_MAX_TOKENS, NEMOTRON_TEMPERATURE
+from agent.nemotron_client import chat_json_array
+from agent.music_theory import (
+    diatonic_progression,
+    melody_pitches_for_key,
+    chord_to_pitches,
+    parse_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +76,43 @@ def chord_to_notes(chord_name: str, octave_offset: int = 0) -> list:
     return [root + i for i in intervals]
 
 
+# ── Analysis context for Nemotron ─────────────────────────────────────────────
+
+def _format_analysis_context(analysis: dict) -> str:
+    lines = [
+        f"- Key: {analysis.get('key', 'Unknown')}",
+        f"- Tempo: {analysis.get('tempo', 120)} BPM",
+        f"- Duration: {analysis.get('duration', 0)}s",
+        f"- Instruments: {', '.join(analysis.get('instruments', []))}",
+        f"- Energy: {analysis.get('energy', 0)} (0=low, 1=high)",
+        f"- Chord progression: {analysis.get('chord_progression', [])}",
+    ]
+
+    if analysis.get("source_type") == "audio":
+        lines.insert(0, "- Source: audio file (estimated features, no MIDI note data)")
+        af = analysis.get("audio_features") or {}
+        if af:
+            lines.append(
+                f"- Audio character: {af.get('brightness', '')} · "
+                f"spectral centroid ~{af.get('spectral_centroid_mean', '?')} · "
+                f"onset density {af.get('onset_density', '?')}"
+            )
+    else:
+        lines.insert(0, "- Source: MIDI file")
+        if analysis.get("has_notes"):
+            sample = analysis.get("note_events", [])[:16]
+            note_str = ", ".join(
+                f"{e.get('name', '?')}@{e.get('start_beat', 0)}b" for e in sample
+            )
+            if note_str:
+                lines.append(f"- Input notes (sample): {note_str}")
+            pcs = analysis.get("pitch_classes", [])
+            if pcs:
+                lines.append(f"- Pitch classes present: {', '.join(pcs)}")
+
+    return "\n".join(lines)
+
+
 # ── Step 1: Nemotron reasoning ────────────────────────────────────────────────
 
 def reason_with_nemotron(analysis: dict, artist_prompt: str = None) -> list:
@@ -81,22 +121,8 @@ def reason_with_nemotron(analysis: dict, artist_prompt: str = None) -> list:
     Returns list of 3 parameter dicts.
     """
     if STUB_MODE:
-        logger.info("STUB_MODE: skipping Nemotron call in reason_with_nemotron")
-        return [
-            {
-                "option": i,
-                "description": f"Stub continuation {i}",
-                "vibe": ["melodic build", "steady groove", "gentle drop"][i - 1],
-                "key": analysis.get("key", "A minor"),
-                "tempo": 120,
-                "energy_direction": ["build", "maintain", "drop"][i - 1],
-                "chord_progression": ["Am", "F", "C", "G"],
-                "suggested_notes": ["A3", "C4", "E4", "G4"],
-                "instruments_to_add": ["bass"] if i == 1 else [],
-                "arrangement_note": "stub",
-            }
-            for i in range(1, 4)
-        ]
+        logger.info("STUB_MODE: using analysis-based stub options")
+        return _analysis_fallback_options(analysis, prompt)
 
     artist_context = (
         f"\nThe artist says: \"{artist_prompt}\"\n"
@@ -104,15 +130,13 @@ def reason_with_nemotron(analysis: dict, artist_prompt: str = None) -> list:
         if artist_prompt else ""
     )
 
+    ctx = _format_analysis_context(analysis)
+    source_label = "audio" if analysis.get("source_type") == "audio" else "MIDI"
+
     prompt = f"""You are an expert music producer and composer.
 
-A producer dropped a MIDI file with these characteristics:
-- Key: {analysis['key']}
-- Tempo: {analysis['tempo']} BPM
-- Duration: {analysis['duration']}s
-- Instruments: {', '.join(analysis['instruments'])}
-- Energy: {analysis['energy']} (0=low, 1=high)
-- Chord progression: {analysis.get('chord_progression', [])}
+A producer dropped a {source_label} file with these characteristics:
+{ctx}
 {artist_context}
 Generate 3 distinct 8-bar continuation options. Each should take the music somewhere different.
 
@@ -132,31 +156,145 @@ Respond ONLY with a valid JSON array of 3 objects, no other text:
   }}
 ]"""
 
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": NEMOTRON_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": NEMOTRON_MAX_TOKENS,
-        "temperature": NEMOTRON_TEMPERATURE,
-    }
-
-    logger.info(f"Asking Nemotron for continuation directions{' (with artist prompt)' if artist_prompt else ''}...")
-    response = requests.post(
-        f"{NVIDIA_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=NEMOTRON_TIMEOUT,
+    logger.info(
+        f"Asking Nemotron for continuation directions"
+        f"{' (with artist prompt)' if artist_prompt else ''}..."
     )
-    response.raise_for_status()
+    return chat_json_array(
+        prompt,
+        task="main",
+        max_tokens=NEMOTRON_MAX_TOKENS,
+        temperature=NEMOTRON_TEMPERATURE,
+    )
 
-    content = response.json()["choices"][0]["message"]["content"].strip()
-    content = content.strip("```json").strip("```").strip()
 
-    return json.loads(content)
+# ── Analysis-matched generation (no generic C-Am-F-G when API fails) ─────────
+
+def _analysis_fallback_options(analysis: dict, prompt: str | None = None) -> list:
+    """Three distinct fills locked to the analyzed key/tempo/chords."""
+    key = analysis.get("key", "A minor")
+    tempo = float(analysis.get("tempo", 120))
+    chords = list(analysis.get("chord_progression") or [])
+    if len(chords) < 2:
+        chords = diatonic_progression(key)
+
+    roles = [
+        ("melody", "Top-line counter-melody", "floating lead", "build"),
+        ("bass", "Sub bass complement", "low end glue", "maintain"),
+        ("harmony", "Chord stabs & pads", "harmonic layer", "drop"),
+    ]
+    options = []
+    for i, (role, desc, vibe, energy) in enumerate(roles, 1):
+        options.append({
+            "option": i,
+            "role": role,
+            "description": f"{desc} in {key} @ {int(tempo)} BPM",
+            "vibe": vibe,
+            "key": key,
+            "tempo": tempo,
+            "energy_direction": energy,
+            "chord_progression": chords,
+            "instruments_to_add": ["bass"] if role == "bass" else [],
+            "arrangement_note": f"Matched to your track — {role} only",
+        })
+    if prompt:
+        for opt in options:
+            opt["description"] += f" ({prompt[:60]})"
+    return options
+
+
+def _pick_chord_tone(chord_name: str, key: str, octave: int = 4) -> int:
+    """Melody pitch that fits the current chord and song key."""
+    tones = chord_to_pitches(chord_name, octave=octave)
+    scale = melody_pitches_for_key(key, octave=octave)
+    for p in tones:
+        if p in scale:
+            return p
+    return tones[0] if tones else scale[0]
+
+
+def generate_matched_continuation(
+    params: dict, analysis: dict, output_path: str, tempo: float,
+):
+    """
+    Build a fill in the song's key — each option is a different layer
+    (melody / bass / harmony), not three copies of the same loop.
+    """
+    key = params.get("key") or analysis.get("key", "A minor")
+    chords = params.get("chord_progression") or analysis.get("chord_progression")
+    if not chords or len(chords) < 2:
+        chords = diatonic_progression(key)
+
+    role = params.get("role")
+    if not role:
+        role = {1: "melody", 2: "bass", 3: "harmony"}.get(int(params.get("option", 1)), "melody")
+
+    midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    spb = 60.0 / tempo
+    bars = 8
+    beats_per_chord = 2.0
+    energy = params.get("energy_direction", "maintain")
+    base_vel = 72 if analysis.get("source_type") == "audio" else 80
+
+    def vel_at(t_frac: float) -> int:
+        if energy == "build":
+            return min(110, base_vel + int(t_frac * 35))
+        if energy == "drop":
+            return max(45, base_vel - int(t_frac * 30))
+        return base_vel + int(np.random.randint(-8, 8))
+
+    if role == "melody":
+        inst = pretty_midi.Instrument(program=81, name="Melody")
+        # Sparse hook: 2 notes per bar on off-beats
+        for bar in range(bars):
+            chord = chords[(bar // 2) % len(chords)]
+            bar_start = bar * 4 * spb
+            for beat_off in (1.5, 3.5):
+                t = bar_start + beat_off * spb
+                pitch = _pick_chord_tone(chord, key, octave=5)
+                inst.notes.append(pretty_midi.Note(
+                    velocity=vel_at(bar / bars),
+                    pitch=min(127, pitch),
+                    start=t,
+                    end=t + spb * 0.45,
+                ))
+        midi.instruments.append(inst)
+
+    elif role == "bass":
+        inst = pretty_midi.Instrument(program=33, name="Bass")
+        for bar in range(bars):
+            chord = chords[(bar // 2) % len(chords)]
+            roots = chord_to_pitches(chord, octave=2)
+            root = roots[0] if roots else 36
+            bar_start = bar * 4 * spb
+            for beat in range(4):
+                t = bar_start + beat * spb
+                inst.notes.append(pretty_midi.Note(
+                    velocity=min(105, vel_at(bar / bars) + 8),
+                    pitch=min(127, max(24, root)),
+                    start=t,
+                    end=t + spb * 0.85,
+                ))
+        midi.instruments.append(inst)
+
+    else:  # harmony — rhythmic chord stabs
+        inst = pretty_midi.Instrument(program=4, name="Harmony")
+        for bar in range(bars):
+            chord = chords[(bar // 2) % len(chords)]
+            bar_start = bar * 4 * spb
+            for beat in (0.0, 2.0):
+                t = bar_start + beat * spb
+                for pitch in chord_to_pitches(chord, octave=3):
+                    inst.notes.append(pretty_midi.Note(
+                        velocity=max(40, vel_at(bar / bars) - 15),
+                        pitch=min(127, pitch),
+                        start=t,
+                        end=t + spb * 1.8,
+                    ))
+        midi.instruments.append(inst)
+
+    midi.write(output_path)
+    logger.info(f"Matched continuation ({role}, {key} @ {tempo}) → {output_path}")
 
 
 # ── Step 2: Generate MIDI from params ────────────────────────────────────────
@@ -338,35 +476,20 @@ def _suggest_with_nemotron(analysis: dict, artist_prompt: str = None) -> str:
 
     context = f"\nArtist direction: \"{artist_prompt}\"" if artist_prompt else ""
 
+    ctx = _format_analysis_context(analysis)
+
     prompt = f"""You are an expert music producer giving creative direction.
 
-MIDI analysis:
-- Key: {analysis['key']} · Tempo: {analysis['tempo']} BPM
-- Duration: {analysis['duration']}s · Energy: {analysis['energy']:.2f}
-- Chords: {' → '.join(analysis.get('chord_progression', []))}{context}
+Analysis:
+{ctx}{context}
 
 Give 3 specific, actionable ideas for where this track could go next.
 Plain text, numbered list, one sentence per idea. No JSON."""
 
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": NEMOTRON_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 300,
-        "temperature": NEMOTRON_TEMPERATURE,
-    }
-
-    response = requests.post(
-        f"{NVIDIA_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=NEMOTRON_TIMEOUT,
+    from agent.nemotron_client import chat_completion
+    return chat_completion(
+        prompt, task="fast", max_tokens=300, temperature=NEMOTRON_TEMPERATURE
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -397,20 +520,13 @@ def generate_continuations(
     try:
         options = reason_with_nemotron(analysis, artist_prompt=prompt)
     except Exception as e:
-        logger.error(f"Nemotron failed, using fallback: {e}")
-        options = [
-            {
-                "option": i, "description": f"Continuation {i}",
-                "vibe": v, "key": analysis["key"],
-                "tempo": analysis["tempo"], "energy_direction": d,
-                "chord_progression": ["C", "Am", "F", "G"],
-                "suggested_notes": ["C4", "E4", "G4"],
-                "instruments_to_add": [],
-            }
-            for i, (v, d) in enumerate(
-                [("melodic build", "build"), ("steady groove", "maintain"), ("gentle drop", "drop")], 1
-            )
-        ]
+        logger.error(f"Nemotron failed, using analysis-matched fallback: {e}")
+        options = _analysis_fallback_options(analysis, prompt)
+
+    # Ensure options use song tempo/key even if the model returned generic values
+    song_key = analysis.get("key", "A minor")
+    song_tempo = float(analysis.get("tempo", 120))
+    song_chords = analysis.get("chord_progression") or diatonic_progression(song_key)
 
     results = []
     for opt in options[:3]:
@@ -418,19 +534,30 @@ def generate_continuations(
         filepath = str(Path(output_dir) / filename)
 
         try:
-            track_tempo = float(opt.get("tempo", analysis["tempo"]))
-            generate_midi_from_params(opt, filepath, track_tempo)
+            opt = dict(opt)
+            opt.setdefault("key", song_key)
+            opt["tempo"] = song_tempo
+            if not opt.get("chord_progression"):
+                opt["chord_progression"] = song_chords
+            if not opt.get("role"):
+                opt["role"] = {1: "melody", 2: "bass", 3: "harmony"}.get(
+                    int(opt.get("option", len(results) + 1)), "melody"
+                )
 
-            # Append drum track to the same MIDI file
-            drum_track = generate_drum_track(
-                tempo=track_tempo,
-                energy=analysis["energy"],
-                style=drum_style,
-            )
-            midi_with_drums = pretty_midi.PrettyMIDI(filepath)
-            midi_with_drums.instruments.append(drum_track)
-            midi_with_drums.write(filepath)
-            logger.info(f"Drums appended ({drum_style}) to {filename}")
+            track_tempo = float(opt["tempo"])
+            generate_matched_continuation(opt, analysis, filepath, track_tempo)
+
+            # Beats already have drums — only add MIDI drums for MIDI input
+            if analysis.get("source_type") != "audio":
+                drum_track = generate_drum_track(
+                    tempo=track_tempo,
+                    energy=analysis["energy"],
+                    style=drum_style,
+                )
+                midi_with_drums = pretty_midi.PrettyMIDI(filepath)
+                midi_with_drums.instruments.append(drum_track)
+                midi_with_drums.write(filepath)
+                logger.info(f"Drums appended ({drum_style}) to {filename}")
 
             results.append({
                 "option": opt.get("option"),

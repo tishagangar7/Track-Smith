@@ -1,142 +1,168 @@
 """
-Composer — takes a plain English vibe description,
-asks Nemotron to translate it into musical parameters,
-then generates 3 original MIDI tracks.
+Composer — plain-English vibe → Nemotron → 3 distinct MIDI compositions.
 """
 
 import os
-import json
 import logging
-import requests
 from pathlib import Path
 
-from agent.config import (
-    NVIDIA_API_KEY, NVIDIA_BASE_URL, NEMOTRON_MODEL,
-    NEMOTRON_TIMEOUT, NEMOTRON_TEMPERATURE
+import pretty_midi
+
+from agent.config import NEMOTRON_MAX_TOKENS, NEMOTRON_TEMPERATURE
+from agent.nemotron_client import chat_json_array
+from agent.skills.continuation_gen import (
+    generate_midi_from_params,
+    generate_drum_track,
+    _infer_drum_style,
 )
-from agent.skills.continuation_gen import generate_midi_from_params
 
 logger = logging.getLogger(__name__)
+
+STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
+
+
+def _heuristic_vibe_options(vibe: str) -> list[dict]:
+    """Keyword-based fallbacks when Nemotron is unavailable."""
+    t = vibe.lower()
+    if "dark" in t or "trap" in t:
+        key, chords, tempo = "D minor", ["Dm", "Gm", "Bb", "F"], 140
+        vibes = ["dark trap", "heavy 808s", "minimal noir"]
+        energies = ["maintain", "build", "drop"]
+    elif "lo-fi" in t or "lofi" in t or "lo fi" in t:
+        key, chords, tempo = "F minor", ["Fm", "Ab", "Eb", "Bb"], 82
+        vibes = ["rainy lo-fi", "dusty keys", "late night"]
+        energies = ["maintain", "build", "drop"]
+    elif "house" in t or "dance" in t:
+        key, chords, tempo = "A minor", ["Am", "F", "C", "G"], 124
+        vibes = ["driving house", "club groove", "filter break"]
+        energies = ["build", "maintain", "drop"]
+    else:
+        key, chords, tempo = "A minor", ["Am", "F", "C", "G"], 90
+        vibes = ["melodic lead", "steady pocket", "sparse breakdown"]
+        energies = ["build", "maintain", "drop"]
+
+    root = key.split()[0]
+    notes = [f"{root}3", f"{root}4"]
+    if "m" in key.lower():
+        notes.extend(["C4", "E4"] if root != "C" else ["Eb4", "G4"])
+    else:
+        notes.extend(["C4", "E4", "G4"])
+
+    return [
+        {
+            "option": i,
+            "vibe_label": vibes[i - 1],
+            "description": f"{vibes[i - 1]} — {vibe[:80]}",
+            "key": key,
+            "tempo": tempo,
+            "chord_progression": chords,
+            "suggested_notes": notes,
+            "instruments_to_add": ["bass"],
+            "energy_direction": energies[i - 1],
+            "arrangement_note": f"variation {i}",
+        }
+        for i in range(1, 4)
+    ]
+
+
+def _stub_vibe_options(vibe: str) -> list[dict]:
+    return _heuristic_vibe_options(vibe)
+
+
+def _vibe_to_options(vibe: str) -> list[dict]:
+    """Ask Nemotron for 3 distinct interpretations of the same vibe text."""
+    if STUB_MODE:
+        logger.info("STUB_MODE: using stub vibe options")
+        return _stub_vibe_options(vibe)
+
+    prompt = f"""You are a world-class music producer and composer.
+
+A producer wants THREE different original 8-bar sketches inspired by this vibe:
+"{vibe}"
+
+Each option must sound noticeably different (harmony, energy, or rhythm), while matching the vibe.
+
+Respond ONLY with a valid JSON array of exactly 3 objects, no markdown:
+[
+  {{
+    "option": 1,
+    "vibe_label": "2-4 word label",
+    "description": "one sentence",
+    "key": "e.g. D minor",
+    "tempo": 140,
+    "chord_progression": ["Dm", "Bb", "F", "C"],
+    "suggested_notes": ["D3", "F3", "A3", "C4"],
+    "instruments_to_add": ["bass"],
+    "energy_direction": "build",
+    "arrangement_note": "what makes this unique"
+  }}
+]"""
+
+    try:
+        logger.info("Asking Nemotron for 3 vibe variations...")
+        options = chat_json_array(
+            prompt,
+            task="main",
+            max_tokens=NEMOTRON_MAX_TOKENS,
+            temperature=NEMOTRON_TEMPERATURE,
+        )
+        return options[:3]
+    except Exception as e:
+        logger.error(f"Nemotron vibe translation failed: {e}")
+        return _heuristic_vibe_options(vibe)
 
 
 def compose_from_vibe(vibe_description: str, output_dir: str) -> list:
     """
     Full composition pipeline from a plain English vibe.
-
-    Example:
-        compose_from_vibe("dark rainy 3am Tokyo lo-fi 85 BPM", "./output")
-
     Returns list of dicts with filepath, description, musical params.
     """
     logger.info(f"Composing from vibe: '{vibe_description}'")
 
-    # step 1: Nemotron translates vibe into musical parameters
-    params = _vibe_to_params(vibe_description)
-    logger.info(f"Nemotron params: {params}")
-
-    # step 2: generate 3 variations with different energy directions
+    options = _vibe_to_options(vibe_description)
+    drum_style = _infer_drum_style(vibe_description)
     Path(output_dir).mkdir(exist_ok=True)
     results = []
-    energy_directions = ["maintain", "build", "drop"]
 
-    for i, energy in enumerate(energy_directions, 1):
+    for opt in options[:3]:
+        i = int(opt.get("option", len(results) + 1))
         filename = f"composition_v{i}.mid"
         filepath = str(Path(output_dir) / filename)
-
-        variation = {**params, "energy_direction": energy, "option": i}
+        tempo = float(opt.get("tempo", 90))
 
         try:
-            generate_midi_from_params(variation, filepath, float(params.get("tempo", 90)))
+            opt["role"] = {1: "melody", 2: "bass", 3: "harmony"}.get(i, "melody")
+            fake_analysis = {
+                "key": opt.get("key", "A minor"),
+                "tempo": tempo,
+                "chord_progression": opt.get("chord_progression", []),
+                "source_type": "vibe",
+                "energy": 0.65,
+            }
+            from agent.skills.continuation_gen import generate_matched_continuation
+            generate_matched_continuation(opt, fake_analysis, filepath, tempo)
+            drum_track = generate_drum_track(
+                tempo=tempo,
+                energy=0.7 if opt.get("energy_direction") != "drop" else 0.4,
+                style=drum_style,
+            )
+            midi_with_drums = pretty_midi.PrettyMIDI(filepath)
+            midi_with_drums.instruments.append(drum_track)
+            midi_with_drums.write(filepath)
+
             results.append({
+                "option": i,
                 "variation": i,
                 "filename": filename,
                 "filepath": filepath,
-                "description": params.get("description", vibe_description),
-                "vibe": params.get("vibe_label", ""),
-                "key": params.get("key", ""),
-                "tempo": params.get("tempo", 90),
-                "mood": params.get("mood", ""),
-                "chord_progression": params.get("chord_progression", []),
-                "energy_direction": energy,
-                "reference_artists": params.get("reference_artists", []),
-                "production_style": params.get("production_style", ""),
+                "description": opt.get("description", vibe_description),
+                "vibe": opt.get("vibe_label", opt.get("vibe", "")),
+                "key": opt.get("key", ""),
+                "tempo": tempo,
+                "chord_progression": opt.get("chord_progression", []),
+                "energy_direction": opt.get("energy_direction", "maintain"),
             })
         except Exception as e:
             logger.error(f"Composition variation {i} failed: {e}")
 
     return results
-
-
-def _vibe_to_params(vibe: str) -> dict:
-    """
-    Ask Nemotron to translate a human vibe description
-    into precise musical parameters.
-    """
-    prompt = f"""You are a world-class music producer and composer.
-
-A producer wants to create an original track with this vibe:
-"{vibe}"
-
-Translate this into precise musical composition parameters.
-
-Respond ONLY with valid JSON, no markdown, no extra text:
-{{
-  "vibe_label": "3-word label e.g. 'dark lo-fi'",
-  "description": "one sentence describing the sound",
-  "mood": "emotional quality e.g. melancholic",
-  "key": "e.g. D minor",
-  "tempo": 85,
-  "time_signature": "4/4",
-  "chord_progression": ["Dm", "Bb", "F", "C"],
-  "suggested_notes": ["D3", "F3", "A3", "C4", "D4"],
-  "instruments": ["Rhodes piano", "bass", "lo-fi drums"],
-  "instruments_to_add": ["bass", "strings"],
-  "energy_direction": "maintain",
-  "arrangement_note": "sparse intro, melody enters bar 5",
-  "reference_artists": ["Nujabes", "J Dilla"],
-  "production_style": "lo-fi hip hop"
-}}"""
-
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": NEMOTRON_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 600,
-        "temperature": NEMOTRON_TEMPERATURE,
-    }
-
-    try:
-        logger.info("Asking Nemotron to translate vibe...")
-        response = requests.post(
-            f"{NVIDIA_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=NEMOTRON_TIMEOUT,
-        )
-        response.raise_for_status()
-
-        content = response.json()["choices"][0]["message"]["content"].strip()
-        content = content.strip("```json").strip("```").strip()
-        return json.loads(content)
-
-    except Exception as e:
-        logger.error(f"Nemotron vibe translation failed: {e}")
-        # sensible fallback so the pipeline doesn't break
-        return {
-            "vibe_label": "custom vibe",
-            "description": vibe,
-            "mood": "expressive",
-            "key": "A minor",
-            "tempo": 90,
-            "chord_progression": ["Am", "F", "C", "G"],
-            "suggested_notes": ["A3", "C4", "E4", "G4"],
-            "instruments_to_add": ["bass"],
-            "energy_direction": "maintain",
-            "arrangement_note": "full arrangement",
-            "reference_artists": [],
-            "production_style": "original",
-        }

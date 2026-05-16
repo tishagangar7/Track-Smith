@@ -11,9 +11,12 @@ def run(vibe_text: str, output_dir: str) -> dict:
 
     lines = [f"Generated {len(results)} variations for: \"{vibe_text}\"", ""]
     for r in results:
-        lines.append(f"[{r['variation']}] {r.get('vibe', '')} · {r.get('key', '')} · {r.get('tempo', '')} BPM")
+        lines.append(
+            f"[{r.get('option', r.get('variation', '?'))}] "
+            f"{r.get('vibe', '')} · {r.get('key', '')} · {r.get('tempo', '')} BPM"
+        )
         lines.append(f"    {r.get('description', '')}")
-        lines.append(f"    {r['filepath']}")
+        lines.append(f"    {r.get('filepath', '')}")
         lines.append("")
 
     return {"type": "files", "message": "\n".join(lines), "files": results}

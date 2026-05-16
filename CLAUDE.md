@@ -4,6 +4,12 @@
 
 AI music production agent. Two modes: Telegram bot (`main.py`) and PyQt6 desktop companion (`plugin_main.py`). Both use the same `agent/` pipeline. Runs Nemotron-4-340B via NVIDIA API. Hardware: ASUS DGX Spark GX10.
 
+## Media input
+
+Drop zone accepts **MIDI** (`.mid`) and **audio** (`.mp3`, `.wav`). MP3 requires `ffmpeg` (`brew install ffmpeg`).
+
+Playback modes: **Input + Fill** (default), Input only, Fill only. MP3 input + continuation plays audio then MIDI sequentially.
+
 ## Run
 
 ```bash

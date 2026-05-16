@@ -4,8 +4,6 @@ Slash command router. Parses input, dispatches to the right command module.
 All command functions are synchronous and meant to run in a QThread worker.
 """
 
-from pathlib import Path
-
 
 def route(raw: str, midi_path: str | None, style_context: str | None, output_dir: str) -> dict:
     """
@@ -43,7 +41,7 @@ def route(raw: str, midi_path: str | None, style_context: str | None, output_dir
 
     if cmd == "/analyze":
         if not midi_path:
-            return {"type": "error", "message": "No MIDI loaded — drop a .mid file first"}
+            return {"type": "error", "message": "No file loaded — drop a MIDI or MP3 first"}
         return analyze.run(midi_path)
 
     elif cmd == "/vibe":
@@ -60,7 +58,7 @@ def route(raw: str, midi_path: str | None, style_context: str | None, output_dir
 
     elif cmd == "/style":
         result = style.run(args)
-        if result["type"] == "text" and "style" in result:
+        if result.get("style"):
             result["type"] = "style"
         return result
 

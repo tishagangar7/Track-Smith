@@ -22,6 +22,21 @@ REPO_ROOT = Path(__file__).parent
 OUTPUT_DIR = str(REPO_ROOT / "plugin_output")
 
 
+def _fix_qt_plugin_path():
+    """macOS/conda: Qt sometimes can't find the cocoa platform plugin."""
+    if os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
+        return
+    try:
+        import PyQt6
+        plugins = Path(PyQt6.__file__).parent / "Qt6" / "plugins"
+        platforms = plugins / "platforms"
+        if platforms.is_dir():
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
+            os.environ.setdefault("QT_PLUGIN_PATH", str(plugins))
+    except Exception:
+        pass
+
+
 def _check_env():
     key = os.getenv("NVIDIA_API_KEY", "")
     if not key:
@@ -31,9 +46,14 @@ def _check_env():
     stub = os.getenv("STUB_MODE", "false").lower() == "true"
     if stub:
         logger.info("STUB_MODE=true — Nemotron calls skipped (testing mode)")
+    else:
+        from agent.config import NEMOTRON_MODEL_MAIN, NEMOTRON_MODEL_FAST
+        logger.info(f"Nemotron main: {NEMOTRON_MODEL_MAIN}")
+        logger.info(f"Nemotron fast: {NEMOTRON_MODEL_FAST}")
 
 
 def main():
+    _fix_qt_plugin_path()
     _check_env()
 
     try:

@@ -1,6 +1,12 @@
 """
-Config — OpenClaw + Nemotron configuration.
-All environment variables and model settings in one place.
+Config — Nemotron / NVIDIA API settings.
+
+Hackathon requirement: use NVIDIA Nemotron family models via
+https://integrate.api.nvidia.com/v1 (API key from build.nvidia.com → View Code).
+
+Default models (both available on integrate.api):
+  - nvidia/nvidia-nemotron-nano-9b-v2          — fast (suggest, light tasks)
+  - nvidia/llama-3.3-nemotron-super-49b-v1.5   — main (fill, vibe, mix reasoning)
 """
 
 import os
@@ -11,10 +17,37 @@ load_dotenv()
 # ── NVIDIA / Nemotron ─────────────────────────────────────────────────────────
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NEMOTRON_MODEL = "nvidia/nemotron-4-340b-instruct"
-NEMOTRON_TIMEOUT = 120       # seconds — 120B model can be slow on first call
-NEMOTRON_MAX_TOKENS = 1500
-NEMOTRON_TEMPERATURE = 0.8   # slightly creative for music tasks
+
+# Hackathon Nemotron models (override in .env if needed)
+NEMOTRON_MODEL_FAST = os.getenv(
+    "NEMOTRON_MODEL_FAST",
+    "nvidia/nvidia-nemotron-nano-9b-v2",
+)
+NEMOTRON_MODEL_MAIN = os.getenv(
+    "NEMOTRON_MODEL_MAIN",
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+)
+# Back-compat: single var maps to main model
+NEMOTRON_MODEL = os.getenv("NEMOTRON_MODEL", NEMOTRON_MODEL_MAIN)
+
+NEMOTRON_TIMEOUT = int(os.getenv("NEMOTRON_TIMEOUT", "120"))
+NEMOTRON_MAX_TOKENS = int(os.getenv("NEMOTRON_MAX_TOKENS", "1500"))
+NEMOTRON_TEMPERATURE = float(os.getenv("NEMOTRON_TEMPERATURE", "0.6"))
+
+# Nemotron-only fallback chain (no Meta Llama non-Nemotron models)
+NEMOTRON_MODEL_FALLBACKS = [
+    m.strip()
+    for m in os.getenv(
+        "NEMOTRON_MODEL_FALLBACKS",
+        ",".join([
+            NEMOTRON_MODEL_MAIN,
+            NEMOTRON_MODEL_FAST,
+            "nvidia/llama-3.3-nemotron-super-49b-v1",
+            "nvidia/nemotron-4-340b-instruct",
+        ]),
+    ).split(",")
+    if m.strip()
+]
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -26,12 +59,10 @@ OUTPUT_FOLDER = os.getenv("OUTPUT_FOLDER", "./output")
 
 # ── Modes ─────────────────────────────────────────────────────────────────────
 DJ_MODE = os.getenv("DJ_MODE", "false").lower() == "true"
+STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
 
-# ── OpenClaw agent config (written to disk for OpenClaw to pick up) ───────────
 OPENCLAW_CONFIG = {
-    "env": {
-        "NVIDIA_API_KEY": NVIDIA_API_KEY,
-    },
+    "env": {"NVIDIA_API_KEY": NVIDIA_API_KEY},
     "models": {
         "providers": {
             "nvidia": {
@@ -42,11 +73,9 @@ OPENCLAW_CONFIG = {
     },
     "agents": {
         "defaults": {
-            "model": {
-                "primary": NEMOTRON_MODEL
-            }
+            "model": {"primary": NEMOTRON_MODEL_MAIN}
         }
-    }
+    },
 }
 
 

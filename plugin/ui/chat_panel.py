@@ -46,7 +46,7 @@ class ChatPanel(QWidget):
         self._build_ui()
         self._append_system(
             "Aux loaded. Commands: /fill  /vibe <text>  /suggest  /analyze  /mix  /style <artist>\n"
-            "Drop a MIDI file on the left panel, then type a command."
+            "Drop MIDI or MP3 on the left, then type a command."
         )
 
     def _build_ui(self):

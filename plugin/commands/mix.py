@@ -1,15 +1,21 @@
-from agent.skills.midi_analyzer import analyze_midi
+from agent.skills.input_analyzer import analyze_input, validate_input_for_generation
 from agent.skills.continuation_gen import generate_continuations
 
 
 def run(midi_path: str, prompt: str = None, style_context: str = None, output_dir: str = "") -> dict:
     if not midi_path:
-        return {"type": "error", "message": "No MIDI loaded — drop a file first"}
+        return {"type": "error", "message": "No file loaded — drop a MIDI or MP3 first"}
 
-    analysis = analyze_midi(midi_path)
+    analysis = analyze_input(midi_path)
+    err = validate_input_for_generation(analysis)
+    if err:
+        return {"type": "error", "message": err}
 
     instruments = ", ".join(analysis.get("instruments", [])) or "melody"
-    mix_directive = f"Generate a complementary stem that pairs with: {instruments}. Add a new instrument layer that fills harmonic space."
+    mix_directive = (
+        f"Generate a complementary stem that pairs with: {instruments}. "
+        "Add a new instrument layer that fills harmonic space."
+    )
     combined_prompt = " ".join(filter(None, [style_context, mix_directive, prompt])) or mix_directive
 
     results = generate_continuations(analysis, output_dir=output_dir, prompt=combined_prompt, mode="full")

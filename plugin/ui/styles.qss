@@ -57,6 +57,30 @@ QPushButton#secondary:hover {
     color: #dde1e7;
 }
 
+QPushButton#secondary:checked {
+    background-color: #00d4aa33;
+    color: #00d4aa;
+    border: 1px solid #00d4aa;
+}
+
+QSlider::groove:horizontal {
+    background: #2a2a3a;
+    height: 8px;
+    border-radius: 4px;
+}
+
+QSlider::handle:horizontal {
+    background: #00d4aa;
+    width: 14px;
+    margin: -4px 0;
+    border-radius: 7px;
+}
+
+QSlider::sub-page:horizontal {
+    background: #00d4aa55;
+    border-radius: 4px;
+}
+
 QPushButton#fl_btn {
     background-color: #1c1c28;
     color: #00d4aa;
