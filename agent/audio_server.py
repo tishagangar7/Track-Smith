@@ -25,22 +25,29 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Aux Audio Server", version="1.0.0")
 
-_MUSICGEN_SAMPLE_RATE = 32000  # MusicgenMelody expected input rate
+_MUSICGEN_SAMPLE_RATE = 32000
 
 _musicgen = None
 _processor = None
+_is_melody_model = False
 
 
 def _load_musicgen():
-    global _musicgen, _processor
+    global _musicgen, _processor, _is_melody_model
     if _musicgen is None:
-        from transformers import AutoProcessor, MusicgenMelodyForConditionalGeneration
-        # musicgen-melody supports both text-only and melody-conditioned generation
-        model_name = os.getenv("MUSICGEN_MODEL", "facebook/musicgen-melody")
+        from transformers import AutoProcessor
+        model_name = os.getenv("MUSICGEN_MODEL", "facebook/musicgen-small")
+        _is_melody_model = "melody" in model_name
         _processor = AutoProcessor.from_pretrained(model_name)
-        _musicgen = MusicgenMelodyForConditionalGeneration.from_pretrained(model_name)
+        if _is_melody_model:
+            from transformers import MusicgenMelodyForConditionalGeneration
+            _musicgen = MusicgenMelodyForConditionalGeneration.from_pretrained(model_name)
+        else:
+            from transformers import MusicgenForConditionalGeneration
+            _musicgen = MusicgenForConditionalGeneration.from_pretrained(model_name)
         if torch.cuda.is_available():
             _musicgen = _musicgen.cuda()
+        logger.info("Loaded %s (melody_conditioning=%s)", model_name, _is_melody_model)
     return _musicgen, _processor
 
 
@@ -58,34 +65,24 @@ def health():
 @app.post("/generate")
 def generate(req: GenerateRequest):
     try:
-        import base64
         import scipy.io.wavfile as wav
-        import torchaudio
 
         model, processor = _load_musicgen()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         max_new_tokens = req.duration * 50  # ~50 tokens/sec
 
-        if req.reference_audio_b64:
-            # Melody-conditioned generation
+        if req.reference_audio_b64 and _is_melody_model:
+            import base64
+            import librosa
             raw_bytes = base64.b64decode(req.reference_audio_b64)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
                 tmp.write(raw_bytes)
                 tmp_path = tmp.name
-
             try:
-                waveform, sample_rate = torchaudio.load(tmp_path)
+                # librosa handles any format (mp3/wav/flac) via soundfile/ffmpeg
+                audio_np, _ = librosa.load(tmp_path, sr=_MUSICGEN_SAMPLE_RATE, mono=True)
             finally:
                 os.unlink(tmp_path)
-
-            # Convert to mono, resample to MusicGen's expected rate
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sample_rate != _MUSICGEN_SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(sample_rate, _MUSICGEN_SAMPLE_RATE)
-                waveform = resampler(waveform)
-
-            audio_np = waveform.squeeze(0).numpy()
             inputs = processor(
                 audio=[audio_np],
                 sampling_rate=_MUSICGEN_SAMPLE_RATE,
@@ -94,7 +91,6 @@ def generate(req: GenerateRequest):
                 return_tensors="pt",
             ).to(device)
         else:
-            # Text-only generation
             inputs = processor(
                 text=[req.prompt],
                 padding=True,
@@ -113,6 +109,7 @@ def generate(req: GenerateRequest):
 
         return Response(content=buf.read(), media_type="audio/wav")
     except Exception as e:
+        logger.error("Generate error: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 

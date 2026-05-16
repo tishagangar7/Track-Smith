@@ -1,18 +1,23 @@
 """
-Chat panel — slash command input + scrolling response log.
+Chat panel — slash command input + scrolling message log.
+Message bubbles match the tracksmith design template (App.jsx).
 Inference runs in a QThread so the UI stays responsive.
 """
 
+import html as _html
+import math
 import subprocess
 import sys
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QLineEdit, QPushButton, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame,
+    QLineEdit, QPushButton, QLabel, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
-from PyQt6.QtGui import QKeyEvent, QTextCursor
+from PyQt6.QtCore import Qt, QThread, QUrl, QTimer, QSize, pyqtSignal
+from PyQt6.QtGui import (
+    QKeyEvent, QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
+)
 
 try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -20,6 +25,302 @@ try:
 except ImportError:
     _HAS_MEDIA = False
 
+# Accent colors cycling for pill tags
+_PILL_COLORS = ["#e8a268", "#7fb3a3", "#c69ad8", "#a7bf7a"]
+
+
+def _h(text: str) -> str:
+    """Escape plain text for QLabel RichText, preserving newlines as <br>."""
+    return _html.escape(str(text)).replace("\n", "<br>")
+
+
+# ── vinyl icon widget ─────────────────────────────────────────────────────────
+
+class _VinylIcon(QWidget):
+    """Tiny vinyl record icon for composer input."""
+
+    def __init__(self, size: int = 16, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self.width()
+        r = s / 2.0
+        p.translate(r, r)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor("#f4ede1")))
+        p.drawEllipse(int(-r), int(-r), s, s)
+
+        groove = QColor(21, 17, 14, 80)
+        p.setPen(QPen(groove, 0.8))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for frac in (0.84, 0.68, 0.54):
+            rr = r * frac
+            p.drawEllipse(int(-rr), int(-rr), int(rr * 2), int(rr * 2))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor("#e8a268")))
+        cr = int(r * 0.30)
+        p.drawEllipse(-cr, -cr, cr * 2, cr * 2)
+
+        p.setBrush(QBrush(QColor("#0f0d0b")))
+        p.drawEllipse(-2, -2, 4, 4)
+        p.end()
+
+
+# ── brand header widget ───────────────────────────────────────────────────────
+
+class _WordmarkWidget(QWidget):
+    """tracksmith wordmark + compact waveform — matches Wordmark.jsx (compact=True)."""
+
+    def __init__(self, size: int = 22, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self._wave_h = int(size * 0.32)
+        self._gap = int(size * 0.14)
+        self.setFixedHeight(size + self._gap + self._wave_h + 2)
+
+    def sizeHint(self):
+        return QSize(220, self._size + self._gap + self._wave_h + 2)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        font = QFont("Inter Tight")
+        font.setPixelSize(self._size)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(QColor("#f4ede1"))
+        p.drawText(0, self._size, "tracksmith")
+
+        fm = QFontMetrics(font)
+        text_w = fm.horizontalAdvance("tracksmith")
+        bar_top = self._size + self._gap
+        unit = text_w / 64
+        for i in range(64):
+            v = abs(math.sin(i * 0.42) + math.sin(i * 0.13) * 0.6) / 1.5
+            h = max(2, int(3 + v * self._wave_h * 0.9))
+            accent = 22 <= i <= 30
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor("#e8a268") if accent else QColor("#f4ede1")))
+            x = int(i * unit)
+            bw = max(1, int(unit * 0.55))
+            y = bar_top + (self._wave_h - h) // 2
+            p.drawRoundedRect(x, y, bw, h, 1, 1)
+        p.end()
+
+
+# ── message widget helpers ────────────────────────────────────────────────────
+
+class _Pill(QWidget):
+    """Colored dot + label pill tag — matches template node ref pills."""
+
+    def __init__(self, text: str, color: str, parent=None):
+        super().__init__(parent)
+        l = QHBoxLayout(self)
+        l.setContentsMargins(9, 4, 9, 4)
+        l.setSpacing(6)
+
+        dot = QLabel()
+        dot.setFixedSize(6, 6)
+        dot.setStyleSheet(f"background:{color}; border-radius:3px;")
+        l.addWidget(dot)
+
+        lbl = QLabel(text)
+        lbl.setTextFormat(Qt.TextFormat.PlainText)
+        lbl.setStyleSheet(
+            "color:rgba(244,237,225,0.58); font-size:11px;"
+            "background:transparent; border:none;"
+        )
+        l.addWidget(lbl)
+
+        self.setStyleSheet(
+            "border:1px solid rgba(255,240,210,0.09);"
+            "border-radius:999px; background:transparent;"
+        )
+
+
+class _UserMsg(QWidget):
+    """Right-aligned user bubble — YOU label + bordered transparent bubble."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(80, 4, 0, 4)
+        outer.setSpacing(5)
+
+        who = QLabel("YOU")
+        who.setAlignment(Qt.AlignmentFlag.AlignRight)
+        who.setStyleSheet(
+            "color:rgba(244,237,225,0.34); font-size:10px;"
+            "background:transparent; border:none;"
+        )
+        outer.addWidget(who)
+
+        bubble = QLabel()
+        bubble.setTextFormat(Qt.TextFormat.RichText)
+        bubble.setText(_h(text))
+        bubble.setWordWrap(True)
+        bubble.setMaximumWidth(340)
+        bubble.setStyleSheet(
+            "background:transparent;"
+            "border:1px solid rgba(255,240,210,0.12);"
+            "border-radius:12px; padding:10px 13px;"
+            "color:#f4ede1; font-size:13px;"
+        )
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch()
+        row.addWidget(bubble)
+        outer.addLayout(row)
+
+
+class _AgentMsg(QWidget):
+    """Left-aligned agent bubble + optional pill tags + optional action buttons."""
+
+    def __init__(self, text: str, pills=None,
+                 on_accept=None, on_tweak=None, on_skip=None,
+                 parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 4, 80, 4)
+        outer.setSpacing(6)
+
+        who = QLabel("AGENT")
+        who.setStyleSheet(
+            "color:rgba(244,237,225,0.34); font-size:10px;"
+            "background:transparent; border:none;"
+        )
+        outer.addWidget(who)
+
+        bubble = QLabel()
+        bubble.setTextFormat(Qt.TextFormat.RichText)
+        bubble.setText(_h(text))
+        bubble.setWordWrap(True)
+        bubble.setMaximumWidth(340)
+        bubble.setStyleSheet(
+            "background:#181513; border-radius:12px;"
+            "padding:11px 14px;"
+            "color:rgba(244,237,225,0.85); font-size:13px;"
+        )
+        outer.addWidget(bubble)
+
+        # Pill tags (node references)
+        if pills:
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 2, 0, 0)
+            rl.setSpacing(6)
+            for txt, clr in pills:
+                rl.addWidget(_Pill(txt, clr))
+            rl.addStretch()
+            outer.addWidget(row)
+
+        # Accept / tweak / skip action buttons
+        if on_accept or on_tweak or on_skip:
+            btn_row = QWidget()
+            bl = QHBoxLayout(btn_row)
+            bl.setContentsMargins(0, 4, 0, 0)
+            bl.setSpacing(6)
+
+            if on_accept:
+                b = QPushButton("accept")
+                b.setStyleSheet(
+                    "background:#e8a268; color:#1a0e06; border:none;"
+                    "border-radius:8px; padding:6px 13px; font-size:12px;"
+                    "font-weight:500;"
+                )
+                b.clicked.connect(on_accept)
+                bl.addWidget(b)
+            for label, fn in [("tweak", on_tweak), ("skip", on_skip)]:
+                if fn:
+                    b = QPushButton(label)
+                    b.setStyleSheet(
+                        "background:transparent; color:rgba(244,237,225,0.58);"
+                        "border:1px solid rgba(255,240,210,0.09);"
+                        "border-radius:8px; padding:6px 13px; font-size:12px;"
+                    )
+                    b.clicked.connect(fn)
+                    bl.addWidget(b)
+            bl.addStretch()
+            outer.addWidget(btn_row)
+
+
+class _SystemMsg(QWidget):
+    """Dim centered system / status text."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel()
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setText(_h(text))
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(
+            "color:rgba(244,237,225,0.34); font-size:11px;"
+            "background:transparent; border:none;"
+        )
+        l.addWidget(lbl)
+
+
+class _ErrorMsg(QWidget):
+    """Red-tinted error bubble."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(0, 0, 0, 0)
+        bubble = QLabel()
+        bubble.setTextFormat(Qt.TextFormat.RichText)
+        bubble.setText(_h(text))
+        bubble.setWordWrap(True)
+        bubble.setStyleSheet(
+            "background:rgba(220,80,80,0.1);"
+            "border:1px solid rgba(220,80,80,0.3);"
+            "border-radius:8px; padding:8px 12px;"
+            "color:#f08080; font-size:13px;"
+        )
+        l.addWidget(bubble)
+
+
+class _ChatLog(QScrollArea):
+    """Scrollable message list — replaces QTextEdit."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("background:transparent; border:none;")
+
+        container = QWidget()
+        container.setStyleSheet("background:transparent;")
+        self._layout = QVBoxLayout(container)
+        self._layout.setContentsMargins(22, 16, 22, 16)
+        self._layout.setSpacing(18)
+        self._layout.addStretch()
+        self.setWidget(container)
+
+    def add_widget(self, w: QWidget) -> QWidget:
+        self._layout.insertWidget(self._layout.count() - 1, w)
+        QTimer.singleShot(20, self._scroll_bottom)
+        return w
+
+    def remove_widget(self, w: QWidget):
+        self._layout.removeWidget(w)
+        w.deleteLater()
+
+    def _scroll_bottom(self):
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+
+# ── inference worker ──────────────────────────────────────────────────────────
 
 class _InferenceWorker(QThread):
     done = pyqtSignal(dict)
@@ -38,6 +339,8 @@ class _InferenceWorker(QThread):
             self.error.emit(str(exc))
 
 
+# ── main panel ────────────────────────────────────────────────────────────────
+
 class ChatPanel(QWidget):
     files_ready = pyqtSignal(list, str)   # (files list, output_dir)
 
@@ -50,6 +353,10 @@ class ChatPanel(QWidget):
         self._history: list[str] = []
         self._hist_idx: int = -1
         self._latest_audio: str | None = None
+        self._audio_combined: str | None = None
+        self._audio_continuation: str | None = None
+        self._showing_combined: bool = True
+        self._thinking_widget: QWidget | None = None
 
         if _HAS_MEDIA:
             self._audio_output = QAudioOutput()
@@ -61,62 +368,157 @@ class ChatPanel(QWidget):
 
         self._build_ui()
         self._append_system(
-            "Aux loaded. Commands: /fill  /vibe <text>  /suggest  /analyze  /mix  /stems  /style <artist>\n"
-            "Drop MIDI or MP3 on the left, then type a command."
+            "tracksmith ready.  /fill  /vibe <text>  /suggest  /analyze  /mix  /stems  /style <artist>\n"
+            "Drop a MIDI or MP3 on the right, then type a command."
         )
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(0)
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        layout.addWidget(self.log, stretch=1)
+        # ── Header: wordmark + waveform + agent status ────────────────────────
+        header = QWidget()
+        header.setObjectName("chat_header")
+        header.setFixedHeight(64)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(22, 10, 22, 10)
 
-        # ── Audio bar (hidden until audio is available) ────────────────────────
+        wordmark = _WordmarkWidget(22)
+        hl.addWidget(wordmark)
+
+        hl.addStretch()
+
+        # Agent status — 6px amber dot + label (matches template)
+        agent_w = QWidget()
+        agent_l = QHBoxLayout(agent_w)
+        agent_l.setContentsMargins(0, 0, 0, 4)
+        agent_l.setSpacing(6)
+        agent_l.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self._agent_dot = QLabel()
+        self._agent_dot.setFixedSize(6, 6)
+        self._agent_dot.setStyleSheet("background-color:#e8a268; border-radius:3px;")
+        agent_l.addWidget(self._agent_dot)
+
+        self._lbl_agent = QLabel("agent on")
+        self._lbl_agent.setStyleSheet("color:rgba(244,237,225,0.34); font-size:11px;")
+        agent_l.addWidget(self._lbl_agent)
+
+        hl.addWidget(agent_w)
+        layout.addWidget(header)
+
+        # ── Session pill (hidden until file analyzed) ──────────────────────────
+        self._session_row = QWidget()
+        self._session_row.setVisible(False)
+        sl = QHBoxLayout(self._session_row)
+        sl.setContentsMargins(22, 10, 22, 2)
+
+        self._session_pill = QWidget()
+        self._session_pill.setObjectName("session_pill_widget")
+        pill_l = QHBoxLayout(self._session_pill)
+        pill_l.setContentsMargins(8, 5, 10, 5)
+        pill_l.setSpacing(8)
+
+        self._pill_dot = QLabel("■")
+        self._pill_dot.setStyleSheet(
+            "color:transparent; font-size:12px;"
+            "background:qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "stop:0 #e8a268,stop:1 #7fb3a3);"
+            "border-radius:3px; min-width:14px; max-width:14px;"
+            "min-height:14px; max-height:14px;"
+        )
+        pill_l.addWidget(self._pill_dot)
+
+        self._lbl_pill_name = QLabel("")
+        self._lbl_pill_name.setObjectName("session_pill_name")
+        pill_l.addWidget(self._lbl_pill_name)
+
+        self._lbl_pill_meta = QLabel("")
+        self._lbl_pill_meta.setObjectName("session_pill_meta")
+        pill_l.addWidget(self._lbl_pill_meta)
+
+        sl.addWidget(self._session_pill)
+        sl.addStretch()
+        layout.addWidget(self._session_row)
+
+        # ── Message log (widget-based, matches template) ───────────────────────
+        self._chat_log = _ChatLog()
+        layout.addWidget(self._chat_log, stretch=1)
+
+        # ── Audio preview panel (placed in right panel by app.py, not here) ──────
+        # Built here so all logic stays in ChatPanel; parent set by TrackSmithApp.
         self._audio_bar = QWidget()
-        audio_row = QHBoxLayout(self._audio_bar)
-        audio_row.setContentsMargins(0, 0, 0, 0)
-        audio_row.setSpacing(6)
+        self._audio_bar.setObjectName("audio_bar")
+        self._audio_bar.setVisible(False)
+        av = QVBoxLayout(self._audio_bar)
+        av.setContentsMargins(20, 12, 20, 12)
+        av.setSpacing(10)
 
-        self._lbl_audio = QLabel("No audio")
-        self._lbl_audio.setStyleSheet("color:#6ac8ff; font-size:11px;")
-        audio_row.addWidget(self._lbl_audio, stretch=1)
+        # Header row — section label + filename
+        hdr = QHBoxLayout()
+        sec_lbl = QLabel("AUDIO PREVIEW")
+        sec_lbl.setObjectName("section_header")
+        hdr.addWidget(sec_lbl)
+        hdr.addStretch()
+        self._lbl_audio = QLabel("")
+        self._lbl_audio.setObjectName("audio_label")
+        hdr.addWidget(self._lbl_audio)
+        av.addLayout(hdr)
 
-        self._btn_play = QPushButton("▶ Play")
-        self._btn_play.setFixedWidth(72)
+        # Button row — all controls clearly visible
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+
+        self._btn_play = QPushButton("▶  Play")
+        self._btn_play.setObjectName("fl_btn_primary")
         self._btn_play.clicked.connect(self._toggle_play)
-        audio_row.addWidget(self._btn_play)
+        btns.addWidget(self._btn_play, stretch=1)
 
-        self._btn_open_folder = QPushButton("Open Folder")
-        self._btn_open_folder.setFixedWidth(90)
-        self._btn_open_folder.clicked.connect(self._open_audio_folder)
-        audio_row.addWidget(self._btn_open_folder)
+        self._btn_toggle_audio = QPushButton("Solo")
+        self._btn_toggle_audio.setObjectName("fl_btn")
+        self._btn_toggle_audio.setToolTip("Toggle between combined mix and fill-only audio")
+        self._btn_toggle_audio.clicked.connect(self._toggle_audio_mode)
+        self._btn_toggle_audio.setVisible(False)
+        btns.addWidget(self._btn_toggle_audio)
 
         self._btn_stems = QPushButton("Separate Stems")
-        self._btn_stems.setFixedWidth(110)
+        self._btn_stems.setObjectName("fl_btn")
         self._btn_stems.clicked.connect(self._separate_stems)
-        audio_row.addWidget(self._btn_stems)
+        btns.addWidget(self._btn_stems)
 
-        self._audio_bar.setVisible(False)
-        layout.addWidget(self._audio_bar)
+        av.addLayout(btns)
+        # NOTE: not added to chat layout — app.py inserts it into the right panel
 
-        # ── Command input row ──────────────────────────────────────────────────
-        row = QHBoxLayout()
-        row.setSpacing(6)
+        # ── Composer — matches template ChatComposer ────────────────────────────
+        composer_wrap = QWidget()
+        composer_wrap.setFixedHeight(68)
+        composer_wrap.setStyleSheet("border-top:1px solid rgba(255,240,210,0.09);")
+        outer = QVBoxLayout(composer_wrap)
+        outer.setContentsMargins(16, 10, 16, 10)
+        outer.setSpacing(0)
+
+        composer_box = QWidget()
+        composer_box.setObjectName("composer_box")
+        inner = QHBoxLayout(composer_box)
+        inner.setContentsMargins(14, 10, 10, 10)
+        inner.setSpacing(10)
+
+        vinyl_icon = _VinylIcon(size=16)
+        inner.addWidget(vinyl_icon)
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("/fill  or  /vibe dark trap 808s  ...")
+        self.input.setObjectName("composer_input")
+        self.input.setPlaceholderText("ask, hum, or drop a reference…")
         self.input.returnPressed.connect(self.send)
-        row.addWidget(self.input, stretch=1)
+        inner.addWidget(self.input, stretch=1)
 
-        self.send_btn = QPushButton("Send")
-        self.send_btn.clicked.connect(self.send)
-        row.addWidget(self.send_btn)
+        self._kbd_badge = QLabel("⌘K")
+        self._kbd_badge.setObjectName("kbd_badge")
+        inner.addWidget(self._kbd_badge)
 
-        layout.addLayout(row)
+        outer.addWidget(composer_box)
+        layout.addWidget(composer_wrap)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -124,12 +526,26 @@ class ChatPanel(QWidget):
         self._midi_path = path
         self._append_system(f"Loaded: {Path(path).name}")
 
+    def set_session(self, name: str, key: str, bpm: int):
+        self._lbl_pill_name.setText(name)
+        self._lbl_pill_meta.setText(f"· {bpm} bpm · {key}" if key else f"· {bpm} bpm")
+        self._session_row.setVisible(True)
+
     def set_output_dir(self, output_dir: str):
         self.output_dir = output_dir
 
     # ── audio controls ────────────────────────────────────────────────────────
 
-    def _set_audio(self, audio_path: str | None):
+    def _set_audio(self, audio_path: str | None, combined: str | None = None, continuation: str | None = None):
+        self._audio_combined = combined
+        self._audio_continuation = continuation
+        self._showing_combined = True
+
+        has_both = bool(combined and continuation)
+        self._btn_toggle_audio.setVisible(has_both)
+        if has_both:
+            self._btn_toggle_audio.setText("Solo")
+
         self._latest_audio = audio_path
         if not audio_path:
             self._audio_bar.setVisible(False)
@@ -145,10 +561,22 @@ class ChatPanel(QWidget):
         if not _HAS_MEDIA:
             self._btn_play.setToolTip("PyQt6.QtMultimedia not installed — use Open Folder to play manually")
 
+    def _toggle_audio_mode(self):
+        if not self._audio_combined or not self._audio_continuation:
+            return
+        self._showing_combined = not self._showing_combined
+        path = self._audio_combined if self._showing_combined else self._audio_continuation
+        self._btn_toggle_audio.setText("Solo" if self._showing_combined else "Combined")
+        self._latest_audio = path
+        self._lbl_audio.setText(Path(path).name)
+        self._btn_play.setText("▶ Play")
+        if self._player:
+            self._player.stop()
+            self._player.setSource(QUrl.fromLocalFile(path))
+
     def _toggle_play(self):
         if not self._latest_audio:
             return
-
         if self._player:
             if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self._player.pause()
@@ -157,39 +585,32 @@ class ChatPanel(QWidget):
                 self._player.play()
                 self._btn_play.setText("⏸ Pause")
         else:
-            # Fallback: open with system default player
             _open_with_system(self._latest_audio)
 
     def _open_audio_folder(self):
         target = self._latest_audio or (self.output_dir if self.output_dir else None)
         if not target:
             return
-        folder = str(Path(target).parent)
-        _open_with_system(folder)
+        _open_with_system(str(Path(target).parent))
 
     def _separate_stems(self):
         target = self._latest_audio or self._midi_path
         if not target:
             self._append_error("No audio loaded. Run /fill first to generate audio.")
             return
-
         path = Path(target)
-        audio_exts = {".wav", ".mp3", ".aiff", ".flac", ".ogg", ".m4a"}
-        if path.suffix.lower() not in audio_exts:
+        if path.suffix.lower() not in {".wav", ".mp3", ".aiff", ".flac", ".ogg", ".m4a"}:
             self._append_error(
                 f"Stem separation needs audio (WAV/MP3), not {path.suffix}.\n"
                 "Run /fill first — audio generates when DGX audio server is online."
             )
             return
-
         self._dispatch_stems(str(path))
 
     def _dispatch_stems(self, audio_path: str):
         from plugin.commands.stems import run as stems_run
-
         self._set_busy(True)
         self._append_system(f"Separating stems from {Path(audio_path).name}...")
-
         self._worker = _InferenceWorker(stems_run, audio_path, self.output_dir)
         self._worker.done.connect(self._on_result)
         self._worker.error.connect(self._on_error)
@@ -219,7 +640,6 @@ class ChatPanel(QWidget):
         if self._worker and self._worker.isRunning():
             self._append_system("Still processing — please wait...")
             return
-
         self._history.insert(0, text)
         self._hist_idx = -1
         self.input.clear()
@@ -228,16 +648,10 @@ class ChatPanel(QWidget):
 
     def _dispatch(self, raw: str):
         from plugin.commands.router import route
-
         self._set_busy(True)
         self._append_system("thinking...")
-
         self._worker = _InferenceWorker(
-            route,
-            raw,
-            self._midi_path,
-            self._style_context,
-            self.output_dir,
+            route, raw, self._midi_path, self._style_context, self.output_dir,
         )
         self._worker.done.connect(self._on_result)
         self._worker.error.connect(self._on_error)
@@ -249,80 +663,80 @@ class ChatPanel(QWidget):
     def _on_result(self, result: dict):
         self._remove_thinking()
         rtype = result.get("type", "text")
-        msg = result.get("message", "")
+        msg   = result.get("message", "")
 
         if rtype == "error":
             self._append_error(msg)
         elif rtype == "style":
             self._style_context = result.get("style")
-            self._append_aux(msg)
+            self._append_agent(msg)
         elif rtype == "files":
-            self._append_aux(msg)
-            # Update audio bar if audio was generated
-            audio_path = result.get("audio_path")
-            self._set_audio(audio_path)
             files = result.get("files", [])
+            pills = [
+                ((f.get("vibe") or Path(f.get("filepath", "")).stem)[:22],
+                 _PILL_COLORS[i % len(_PILL_COLORS)])
+                for i, f in enumerate(files[:4])
+            ]
+            self._append_agent(msg, pills=pills or None)
+            self._set_audio(
+                result.get("audio_path"),
+                combined=result.get("audio_combined"),
+                continuation=result.get("audio_continuation"),
+            )
             if files:
                 self.files_ready.emit(files, self.output_dir)
         elif rtype == "stems":
-            self._append_aux(msg)
+            self._append_agent(msg)
             stems_dir = result.get("stems_dir", "")
             if stems_dir:
                 self._append_system(f"Stems saved to: {stems_dir}")
         else:
-            self._append_aux(msg)
+            self._append_agent(msg)
 
     def _on_error(self, err: str):
         self._remove_thinking()
         self._append_error(f"Error: {err}")
 
-    # ── log helpers ───────────────────────────────────────────────────────────
+    # ── message helpers ───────────────────────────────────────────────────────
 
     def _append_user(self, text: str):
-        self._raw(f'<p style="color:#dde1e7; margin:4px 0"><b style="color:#00d4aa">you</b>&nbsp; {_esc(text)}</p>')
+        self._chat_log.add_widget(_UserMsg(text))
 
+    def _append_agent(self, text: str, pills=None,
+                      on_accept=None, on_tweak=None, on_skip=None):
+        self._chat_log.add_widget(
+            _AgentMsg(text, pills=pills,
+                      on_accept=on_accept, on_tweak=on_tweak, on_skip=on_skip)
+        )
+
+    # keep alias for any external callers
     def _append_aux(self, text: str):
-        body = _esc(text).replace("\n", "<br>")
-        self._raw(f'<p style="color:#aab0bb; margin:4px 0"><b style="color:#6ac8ff">aux</b>&nbsp; {body}</p>')
+        self._append_agent(text)
 
     def _append_system(self, text: str):
-        body = _esc(text).replace("\n", "<br>")
-        self._raw(f'<p style="color:#555770; font-size:11px; margin:2px 0">{body}</p>')
+        w = _SystemMsg(text)
+        if text.startswith("thinking"):
+            self._thinking_widget = w
+        self._chat_log.add_widget(w)
 
     def _append_error(self, text: str):
-        body = _esc(text).replace("\n", "<br>")
-        self._raw(f'<p style="color:#ff6b6b; margin:4px 0"><b>error</b>&nbsp; {body}</p>')
+        self._chat_log.add_widget(_ErrorMsg(text))
 
     def _remove_thinking(self):
-        html = self.log.toHtml()
-        idx = html.rfind("thinking...")
-        if idx != -1:
-            p_start = html.rfind("<p", 0, idx)
-            p_end = html.find("</p>", idx) + 4
-            if p_start != -1 and p_end > 4:
-                html = html[:p_start] + html[p_end:]
-                self.log.setHtml(html)
-                cursor = self.log.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                self.log.setTextCursor(cursor)
-
-    def _raw(self, html: str):
-        self.log.moveCursor(QTextCursor.MoveOperation.End)
-        self.log.insertHtml(html)
-        self.log.moveCursor(QTextCursor.MoveOperation.End)
+        if self._thinking_widget:
+            self._chat_log.remove_widget(self._thinking_widget)
+            self._thinking_widget = None
 
     def _set_busy(self, busy: bool):
         self.input.setEnabled(not busy)
-        self.send_btn.setEnabled(not busy)
-        self.send_btn.setText("..." if busy else "Send")
-
-
-def _esc(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-    )
+        self.input.setPlaceholderText(
+            "thinking…" if busy else "ask, hum, or drop a reference…"
+        )
+        self._kbd_badge.setStyleSheet(
+            "color:rgba(232,162,104,0.7); font-size:10px; padding:4px 7px;"
+            "border:1px solid rgba(232,162,104,0.3); border-radius:5px; background:transparent;"
+            if busy else ""
+        )
 
 
 def _open_with_system(path: str):

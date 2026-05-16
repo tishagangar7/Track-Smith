@@ -15,6 +15,10 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(str(Path(__file__).parent / "app.log"), mode="a"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -67,14 +71,28 @@ def main():
         )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Aux")
-    app.setOrganizationName("Aux")
+    app.setApplicationName("tracksmith")
+    app.setOrganizationName("tracksmith")
 
-    from plugin.app import AuxApp
-    window = AuxApp(output_dir=OUTPUT_DIR)
-    window.show()
+    from plugin.ui.loading_screen import LoadingScreen
 
-    logger.info(f"Aux plugin started. Output: {OUTPUT_DIR}")
+    splash = LoadingScreen()
+    splash.setWindowTitle("tracksmith")
+    splash.resize(1080, 700)
+    splash.show()
+
+    _state: dict = {}
+
+    def _launch():
+        from plugin.app import TrackSmithApp
+        window = TrackSmithApp(output_dir=OUTPUT_DIR)
+        _state["window"] = window
+        window.show()
+        splash.close()
+
+    splash.ready.connect(_launch)
+
+    logger.info(f"tracksmith started. Output: {OUTPUT_DIR}")
     sys.exit(app.exec())
 
 

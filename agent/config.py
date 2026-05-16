@@ -18,14 +18,19 @@ load_dotenv()
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1")
 
+# Local DGX Ollama — set to use local Nemotron instead of cloud (no timeouts, free)
+# SSH tunnel: ssh -L 11434:localhost:11434 -L 8001:localhost:8001 asus@gx10-d8fb -N
+DGX_OLLAMA_URL = os.getenv("DGX_OLLAMA_URL", "").strip().rstrip("/")
+_LOCAL_NEMOTRON = bool(DGX_OLLAMA_URL)
+
 # Hackathon Nemotron models (override in .env if needed)
 NEMOTRON_MODEL_FAST = os.getenv(
     "NEMOTRON_MODEL_FAST",
-    "nvidia/nvidia-nemotron-nano-9b-v2",
+    "nemotron-3-super:latest" if _LOCAL_NEMOTRON else "nvidia/nvidia-nemotron-nano-9b-v2",
 )
 NEMOTRON_MODEL_MAIN = os.getenv(
     "NEMOTRON_MODEL_MAIN",
-    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "nemotron-3-super:latest" if _LOCAL_NEMOTRON else "nvidia/llama-3.3-nemotron-super-49b-v1.5",
 )
 # Back-compat: single var maps to main model
 NEMOTRON_MODEL = os.getenv("NEMOTRON_MODEL", NEMOTRON_MODEL_MAIN)
@@ -39,19 +44,26 @@ NEMOTRON_MAX_TOKENS = int(os.getenv("NEMOTRON_MAX_TOKENS", "1500"))
 NEMOTRON_TEMPERATURE = float(os.getenv("NEMOTRON_TEMPERATURE", "0.6"))
 
 # Nemotron-only fallback chain (no Meta Llama non-Nemotron models)
+_default_fallbacks = (
+    ",".join(["nemotron-3-super:latest", "nemotron3:33b", "qwen3.6:35b"])
+    if _LOCAL_NEMOTRON else
+    ",".join([
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "nvidia/nvidia-nemotron-nano-9b-v2",
+    ])
+)
 NEMOTRON_MODEL_FALLBACKS = [
     m.strip()
-    for m in os.getenv(
-        "NEMOTRON_MODEL_FALLBACKS",
-        ",".join([
-            NEMOTRON_MODEL_MAIN,
-            NEMOTRON_MODEL_FAST,
-            "nvidia/llama-3.3-nemotron-super-49b-v1",
-            "nvidia/nemotron-4-340b-instruct",
-        ]),
-    ).split(",")
+    for m in os.getenv("NEMOTRON_MODEL_FALLBACKS", _default_fallbacks).split(",")
     if m.strip()
 ]
+
+# ── OpenRouter (fallback for Nemotron when NVIDIA API is unavailable) ─────────
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Nemotron equivalents on OpenRouter
+OPENROUTER_MODEL_MAIN = "nvidia/nemotron-nano-9b-v2"
+OPENROUTER_MODEL_FAST = "nvidia/nemotron-nano-9b-v2"
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")

@@ -20,17 +20,28 @@ class AudioServerOfflineError(Exception):
 
 # Keyword → producer-grade descriptor. Checked in order; multiple can match.
 _STYLE_MAP: list[tuple[set[str], str]] = [
-    ({"trap", "drill"},         "trap drums, 808 sub bass, triplet hi-hats"),
-    ({"808"},                   "heavy 808 sub bass, trap drums"),
+    # Genre keywords
+    ({"trap", "drill"},          "trap drums, 808 sub bass, triplet hi-hats"),
+    ({"808"},                    "heavy 808 sub bass, trap drums"),
     ({"lo-fi", "lofi", "lo fi"}, "lo-fi hip hop, jazzy piano, dusty drums, vinyl warmth"),
-    ({"dark"},                  "dark, moody, minor key atmosphere"),
-    ({"drake", "melodic"},      "melodic, emotional, atmospheric pads, vocal chops"),
-    ({"jazz", "jazzy"},         "jazz piano, walking bass, brushed drums"),
-    ({"house", "dance"},        "four-on-the-floor kick, punchy synth bass, dance music"),
-    ({"ambient", "atmospheric"}, "ambient textural pads, reverb wash, slow attack"),
-    ({"r&b", "rnb", "soul"},    "R&B, soulful smooth chords, vocal chops"),
-    ({"rage", "pluggnb"},       "pluggnb, icy bells, heavy bass, Atlanta"),
-    ({"boom bap", "boom-bap"},  "boom bap, sampled drums, punchy snare, NYC hip hop"),
+    ({"dark"},                   "dark, moody, minor key atmosphere"),
+    ({"jazz", "jazzy"},          "jazz piano, walking bass, brushed drums"),
+    ({"house", "dance"},         "four-on-the-floor kick, punchy synth bass, dance music"),
+    ({"ambient", "atmospheric"},  "ambient textural pads, reverb wash, slow attack"),
+    ({"r&b", "rnb", "soul"},     "R&B, soulful smooth chords, vocal chops"),
+    ({"rage", "pluggnb"},        "pluggnb, icy bells, heavy bass, Atlanta"),
+    ({"boom bap", "boom-bap"},   "boom bap, sampled drums, punchy snare, NYC hip hop"),
+    # Artist names → sonic signature
+    ({"taylor swift", "taylor"}, "pop, synth-pop, shimmering electric guitar, anthemic chorus, bright production"),
+    ({"drake", "melodic"},       "melodic, emotional, atmospheric pads, vocal chops"),
+    ({"kendrick", "kdot"},       "west coast hip hop, jazz samples, complex rhythms, layered percussion"),
+    ({"weeknd", "the weeknd"},   "dark synth-pop, 80s retro, lush reverb, moody bass"),
+    ({"billie", "billie eilish"}, "minimalist pop, whisper vocals, sub bass, sparse dark production"),
+    ({"kanye", "ye"},            "soul samples, chopped vocals, maximalist layers, Chicago soul"),
+    ({"future"},                 "trap, auto-tune melody, dark 808s, melodic rap"),
+    ({"travis scott", "travis"}, "psychedelic trap, warped synths, 808 slides, layered ad-libs"),
+    ({"sza"},                    "alt R&B, warm guitars, jazzy chords, dreamy atmosphere"),
+    ({"metro boomin", "metro"},  "dark trap, cinematic strings, heavy 808s, orchestral elements"),
 ]
 
 _ENERGY_DESCRIPTORS = {
@@ -72,6 +83,11 @@ def build_musicgen_prompt(analysis: dict, prompt: str | None = None) -> str:
     parts.append(key)
     parts.append(f"{tempo} BPM")
 
+    # Lock to the detected chord progression so harmonics match the input
+    chords = analysis.get("chord_progression") or []
+    if chords:
+        parts.append(f"chord progression {' '.join(chords)}")
+
     # Append any free-text from the user verbatim at the end
     if prompt:
         parts.append(prompt)
@@ -111,15 +127,69 @@ def generate_audio_continuation(
         resp = httpx.post(
             f"{AUDIO_SERVER_URL}/generate",
             json=body,
-            timeout=300.0,
+            timeout=httpx.Timeout(connect=5.0, read=300.0, write=60.0, pool=5.0),
         )
         resp.raise_for_status()
     except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
         raise AudioServerOfflineError(f"Audio server unreachable: {e}") from e
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        raise AudioServerOfflineError(f"Audio server error {e.response.status_code}: {detail}") from e
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_bytes(resp.content)
     logger.info("[MusicGen] saved → %s", output_path)
+    return output_path
+
+
+def combine_audio_with_continuation(
+    original_path: str,
+    continuation_path: str,
+    output_path: str,
+    crossfade_sec: float = 1.5,
+) -> str:
+    """Crossfade-combine original audio with generated continuation into one WAV."""
+    import numpy as np
+    import soundfile as sf
+    import librosa
+
+    TARGET_SR = 44100
+
+    y_orig, _ = librosa.load(original_path, sr=TARGET_SR, mono=False)
+    y_cont, _ = librosa.load(continuation_path, sr=TARGET_SR, mono=False)
+
+    # Ensure stereo (2, samples)
+    if y_orig.ndim == 1:
+        y_orig = np.stack([y_orig, y_orig])
+    if y_cont.ndim == 1:
+        y_cont = np.stack([y_cont, y_cont])
+
+    # Normalise both to -1..1 peak, then match levels to original
+    orig_peak = np.abs(y_orig).max() or 1.0
+    cont_peak = np.abs(y_cont).max() or 1.0
+    y_cont = y_cont * (orig_peak / cont_peak)
+
+    xfade = int(crossfade_sec * TARGET_SR)
+    xfade = min(xfade, y_orig.shape[1], y_cont.shape[1])
+
+    fade_out = np.linspace(1.0, 0.0, xfade, dtype=np.float32)
+    fade_in  = np.linspace(0.0, 1.0, xfade, dtype=np.float32)
+
+    body  = y_orig[:, :-xfade] if y_orig.shape[1] > xfade else y_orig[:, :0]
+    blend = y_orig[:, -xfade:] * fade_out + y_cont[:, :xfade] * fade_in
+    tail  = y_cont[:, xfade:]
+
+    combined = np.concatenate([body, blend, tail], axis=1)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    sf.write(output_path, combined.T, TARGET_SR)
+    logger.info("[combine] %s + %s → %s (%.1fs)",
+                Path(original_path).name, Path(continuation_path).name,
+                Path(output_path).name, combined.shape[1] / TARGET_SR)
     return output_path
 
 
@@ -134,11 +204,18 @@ def separate_stems(audio_path: str, output_dir: str) -> dict[str, str]:
             resp = httpx.post(
                 f"{AUDIO_SERVER_URL}/stems",
                 files={"file": (Path(audio_path).name, f, "audio/wav")},
-                timeout=300.0,
+                timeout=httpx.Timeout(connect=5.0, read=300.0, write=60.0, pool=5.0),
             )
         resp.raise_for_status()
     except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
         raise AudioServerOfflineError(f"Audio server unreachable: {e}") from e
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            pass
+        raise AudioServerOfflineError(f"Audio server error {e.response.status_code}: {detail}") from e
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
