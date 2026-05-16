@@ -353,6 +353,7 @@ class ChatPanel(QWidget):
             files = result.get("files", [])
             if files:
                 self.files_ready.emit(files, self.output_dir)
+            self._append_policy_log()
         elif rtype == "stems":
             self._append_aux(msg)
             stems_dir = result.get("stems_dir", "")
@@ -381,6 +382,26 @@ class ChatPanel(QWidget):
     def _append_error(self, text: str):
         body = _esc(text).replace("\n", "<br>")
         self._raw(f'<p style="color:#ff6b6b; margin:4px 0"><b>error</b>&nbsp; {body}</p>')
+
+    def _append_policy_log(self):
+        from agent.openclaw_client import openclaw
+        entries = openclaw.get_recent_log(5)
+        if not entries:
+            return
+        lines = []
+        for e in entries:
+            icon = "✅" if e["status"] == "allowed" else "🚫"
+            label = e["status"].upper()
+            detail = f" ({_esc(e['detail'])})" if e.get("detail") else ""
+            lines.append(
+                f'{icon} <span style="color:#888">{label}</span>'
+                f'&nbsp; {_esc(e["action"])} → {_esc(e["resource"])}{detail}'
+            )
+        body = "<br>".join(lines)
+        self._raw(
+            f'<p style="color:#666; font-size:10px; margin:6px 0 2px 0">'
+            f'<b style="color:#555">Agent Activity</b><br>{body}</p>'
+        )
 
     def _remove_thinking(self):
         html = self.log.toHtml()

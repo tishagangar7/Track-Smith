@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Union
 
 from agent.config import NEMOTRON_MAX_TOKENS, NEMOTRON_TEMPERATURE
-from agent.nemotron_client import chat_json_array
+from agent.nemotron_client import chat_completion, chat_json_array
+from agent.openclaw_client import openclaw
 from agent.music_theory import (
     diatonic_progression,
     melody_pitches_for_key,
@@ -287,13 +288,47 @@ def reason_with_nemotron(analysis: dict, artist_prompt: str = None) -> list:
         chords = chords + chords
     chords = chords[:4]
 
+    react_iterations = 0  # total Reason→Act→Observe cycles completed
+
     if STUB_MODE:
         logger.info("STUB_MODE: using fallback plans")
         result = _fallback_plans(analysis, artist_prompt)
     else:
         energy_label = "low" if energy < 0.4 else ("high" if energy > 0.7 else "medium")
         artist_ctx = f'\nArtist direction: "{artist_prompt}"' if artist_prompt else ""
+        ctx = _format_analysis_context(analysis)
 
+        # ── STEP 1: REASON — Nemotron identifies what this continuation needs ──
+        logger.info("ReAct Step 1: Nemotron reasoning about track...")
+        openclaw.call_nemotron("ReAct Step 1: track reasoning")
+        _reason_system = (
+            "You are an expert music producer assistant. /no_think\n"
+            "Respond with plain text only. No JSON, no markdown."
+        )
+        _reason_prompt = (
+            f"Given this track analysis, identify what this continuation needs:\n"
+            f"Key: {key} | Tempo: {tempo} BPM | Energy: {energy:.2f} ({energy_label}){artist_ctx}\n"
+            f"{ctx}\n\n"
+            f"Think step by step:\n"
+            f"1. Key compatibility: which scales or modes complement {key}?\n"
+            f"2. Energy matching: what intensity and tempo feel suit energy={energy:.2f}?\n"
+            f"3. Genre consistency: what genres or moods complement this track?\n\n"
+            f"Be concise — 3-5 sentences. This analysis guides plan generation."
+        )
+        try:
+            reasoning = chat_completion(
+                _reason_prompt,
+                task="fast",
+                max_tokens=256,
+                temperature=0.7,
+                system_prompt=_reason_system,
+            )
+            logger.info("ReAct Step 1 complete: %s", reasoning[:120].replace("\n", " "))
+        except Exception as _e:
+            logger.warning("ReAct Step 1 failed (%s) — skipping reasoning context", _e)
+            reasoning = ""
+
+        # ── Shared prompts for STEP 2 (ACT) ───────────────────────────────────
         system_prompt = (
             "You are a music producer's AI assistant. "
             "Given an analysis of an input track, decide the genre, mood, "
@@ -331,9 +366,7 @@ EXAMPLE (A minor, 90 BPM, energy=0.45):
 ]
 END EXAMPLE"""
 
-        ctx = _format_analysis_context(analysis)
-
-        prompt = f"""\
+        base_prompt = f"""\
 Analyze this track and return 3 distinct producer loop plans.
 
 TRACK ANALYSIS:
@@ -376,19 +409,122 @@ Generate 3 plans for THIS track. Respond ONLY with a valid JSON array of 3 objec
   }}
 ]"""
 
-        if DEBUG:
-            logger.debug("=== Nemotron PROMPT ===\n%s\n=== END PROMPT ===", prompt)
-
-        result = chat_json_array(
-            prompt,
-            task="main",
-            max_tokens=NEMOTRON_MAX_TOKENS,
-            temperature=0.9,
-            system_prompt=system_prompt,
+        # Prepend STEP 1 reasoning as additional context for STEP 2
+        act_base = (
+            f"Musical requirements identified:\n{reasoning}\n\n{base_prompt}"
+            if reasoning else base_prompt
         )
 
-        if DEBUG:
-            logger.debug("=== Nemotron RAW RESPONSE ===\n%s\n=== END RESPONSE ===", result)
+        # ── STEP 2 + 3: ACT → OBSERVE loop (max 2 revisions) ─────────────────
+        _MAX_REVISIONS = 2
+        result = None
+        revision_feedback = ""
+
+        for _attempt in range(_MAX_REVISIONS + 1):
+            react_iterations = _attempt + 1
+
+            # ACT
+            logger.info(
+                "ReAct Step 2: Nemotron generating musical plan... (attempt %d)", _attempt + 1
+            )
+            openclaw.call_nemotron(f"ReAct Step 2: plan generation attempt {_attempt + 1}")
+
+            act_prompt = (
+                f"{act_base}\n\n"
+                f"REVISION REQUIRED — previous plan had this issue:\n{revision_feedback}\n"
+                f"Fix this specific issue in your new plan."
+                if revision_feedback else act_base
+            )
+
+            if DEBUG:
+                logger.debug(
+                    "=== Nemotron PROMPT (attempt %d) ===\n%s\n=== END ===",
+                    _attempt + 1, act_prompt,
+                )
+
+            try:
+                candidate = chat_json_array(
+                    act_prompt,
+                    task="main",
+                    max_tokens=NEMOTRON_MAX_TOKENS,
+                    temperature=0.9,
+                    system_prompt=system_prompt,
+                )
+            except Exception as _e:
+                logger.error("ReAct Step 2 failed on attempt %d: %s", _attempt + 1, _e)
+                if result is None:
+                    raise
+                break  # keep last good result
+
+            if DEBUG:
+                logger.debug(
+                    "=== Nemotron RAW (attempt %d) ===\n%s\n=== END ===",
+                    _attempt + 1, candidate,
+                )
+
+            result = candidate
+
+            # Skip OBSERVE on the final allowed attempt — just use what we have
+            if _attempt >= _MAX_REVISIONS:
+                logger.info("ReAct: max revisions reached — using best plan")
+                break
+
+            # OBSERVE — Nemotron evaluates its own plan
+            logger.info("ReAct Step 3: Nemotron evaluating plan...")
+            openclaw.call_nemotron("ReAct Step 3: self-evaluation")
+
+            plan_summary = "\n".join(
+                f"Option {p.get('option', i + 1)}: genre={p.get('genre', '?')} | "
+                f"drums={p.get('drum_pattern', '?')} | bass={p.get('bass_pattern', '?')} | "
+                f"mood={p.get('mood', '?')} | chords={p.get('chord_progression', '?')}"
+                for i, p in enumerate(candidate[:3])
+            )
+            observe_prompt = (
+                f"Review this musical plan against the original track analysis.\n\n"
+                f"ORIGINAL TRACK: Key: {key} | Tempo: {tempo} BPM | Energy: {energy:.2f} ({energy_label})\n\n"
+                f"PROPOSED PLANS:\n{plan_summary}\n\n"
+                f"Evaluate:\n"
+                f"1. Do chord progressions stay in {key}?\n"
+                f"2. Is energy level appropriate for energy={energy:.2f}?\n"
+                f"3. Are the 3 options musically distinct (different genre + drum pattern)?\n\n"
+                f"If the plan is good, respond with exactly: APPROVED\n"
+                f"If there is an issue, respond with: REVISE: [one-sentence description of the specific problem]"
+            )
+            observe_system = (
+                "You are a music theory expert reviewing AI-generated production plans. /no_think\n"
+                "Respond with ONLY 'APPROVED' or 'REVISE: [issue]'. Nothing else."
+            )
+
+            try:
+                evaluation = chat_completion(
+                    observe_prompt,
+                    task="fast",
+                    max_tokens=80,
+                    temperature=0.3,
+                    system_prompt=observe_system,
+                ).strip()
+                logger.info("ReAct Step 3 evaluation: %s", evaluation[:100])
+            except Exception as _e:
+                logger.warning("ReAct Step 3 failed (%s) — accepting plan", _e)
+                evaluation = "APPROVED"
+
+            if evaluation.upper().startswith("APPROVED"):
+                logger.info("ReAct approved plan after %d iteration(s)", _attempt + 1)
+                break
+            elif evaluation.upper().startswith("REVISE"):
+                revision_feedback = (
+                    evaluation[evaluation.index(":") + 1:].strip()
+                    if ":" in evaluation else evaluation
+                )
+                logger.info("ReAct requesting revision: %s", revision_feedback)
+                # loop continues to next attempt
+            else:
+                logger.warning("ReAct Step 3 unexpected response %r — accepting plan", evaluation)
+                break
+
+    # Tag plans with ReAct iteration count for result metadata
+    for plan in result:
+        plan["_react_iterations"] = react_iterations
 
     # Sanitize fields — runs for both STUB_MODE and live paths
     for plan in result:
@@ -843,6 +979,7 @@ def _render_producer_loop(
         if track.notes:
             midi.instruments.append(track)
 
+    openclaw.log_midi_write(output_path)
     midi.write(output_path)
     ai_names = [t.name for t in [drums, bass, chords_track, lead, percs, fx] if t.notes]
     logger.info(
@@ -1133,6 +1270,7 @@ def generate_continuations(
         plans = _fallback_plans(analysis, prompt)
 
     # Two-model pipeline: local Qwen validates + refines Nemotron's output
+    openclaw.call_local_model("Qwen plan validation")
     plans = refine_with_local_model(plans, analysis)
 
     results = []
@@ -1167,6 +1305,7 @@ def generate_continuations(
                 "chord_progression": plan.get("chord_progression", song_chords),
                 "drum_pattern":     plan.get("drum_pattern", ""),
                 "bass_pattern":     plan.get("bass_pattern", ""),
+                "react_iterations": plan.get("_react_iterations", 1),
             })
         except Exception as e:
             logger.error(f"Loop render failed for option {option_n}: {e}", exc_info=True)

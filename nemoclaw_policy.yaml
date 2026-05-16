@@ -1,0 +1,35 @@
+name: aux-music-agent
+version: "1.0"
+description: >
+  Aux is an AI music production agent. It may only access the producer's
+  music folder and NVIDIA APIs. All other file and network access is denied.
+
+allow:
+  filesystem:
+    read:
+      - ~/Track-Smith/watched          # producer drops files here
+      - ~/Track-Smith/plugin_output    # generated output
+      - ~/Track-Smith/agent            # agent code (read-only)
+      - ~/.cache/huggingface           # model cache
+    write:
+      - ~/Track-Smith/plugin_output    # generated audio and MIDI
+      - ~/Track-Smith/watched          # temp files during processing
+  network:
+    - api.nvidia.com                   # Nemotron cloud reasoning
+    - integrate.api.nvidia.com         # NVIDIA API gateway
+    - 127.0.0.1:8001                   # local MusicGen server
+    - 127.0.0.1:8000                   # local Qwen server
+    - 100.77.70.20:8001               # DGX MusicGen over Tailscale
+    - 100.77.70.20:8000               # DGX Qwen over Tailscale
+    - 100.77.70.20:18789              # OpenClaw gateway
+
+deny:
+  filesystem:
+    read:
+      - ~/Documents
+      - ~/Desktop
+      - ~/Downloads
+      - ~/.ssh
+      - ~/.env
+  network:
+    - "*"                              # block all other outbound

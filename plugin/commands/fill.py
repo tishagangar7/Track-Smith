@@ -54,9 +54,11 @@ def run(midi_path: str, prompt: str = None, style_context: str = None, output_di
     ]
     if audio_note:
         lines.append(audio_note)
+    react_steps = max((r.get("react_iterations", 1) for r in results), default=1)
     lines += [
         "",
         f"Generated {len(results)} MIDI continuations (full 6-track producer loop):",
+        f"Reasoning: {react_steps} ReAct step(s) — Reason → Act → Observe",
         "",
     ]
     for r in results:
