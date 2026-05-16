@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  aux:
+    build: .
+    container_name: aux-agent
+    env_file: .env
+    volumes:
+      - ./watched:/app/watched      # drop MIDIs here
+      - ./output:/app/output        # generated files appear here
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
