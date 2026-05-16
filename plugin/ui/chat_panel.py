@@ -20,6 +20,8 @@ try:
 except ImportError:
     _HAS_MEDIA = False
 
+_AUDIO_EXTS = {".wav", ".mp3", ".aiff", ".flac", ".ogg", ".m4a"}
+
 
 class _InferenceWorker(QThread):
     done = pyqtSignal(dict)
@@ -38,6 +40,20 @@ class _InferenceWorker(QThread):
             self.error.emit(str(exc))
 
 
+class _LoopBuildWorker(QThread):
+    """Runs ffmpeg concat in background. Emits loop_path (str) or empty string on failure."""
+    done = pyqtSignal(str)
+
+    def __init__(self, original: str, fill: str, output: str):
+        super().__init__()
+        self.original = original
+        self.fill = fill
+        self.output = output
+
+    def run(self):
+        self.done.emit(_concat_audio_ffmpeg(self.original, self.fill, self.output) or "")
+
+
 class ChatPanel(QWidget):
     files_ready = pyqtSignal(list, str)   # (files list, output_dir)
 
@@ -45,19 +61,27 @@ class ChatPanel(QWidget):
         super().__init__(parent)
         self.output_dir = output_dir
         self._midi_path: str | None = None
+        self._original_audio_path: str | None = None   # audio-only, for loop building
         self._style_context: str | None = None
         self._worker: _InferenceWorker | None = None
+        self._loop_worker: _LoopBuildWorker | None = None
         self._history: list[str] = []
         self._hist_idx: int = -1
         self._latest_audio: str | None = None
+        self._full_loop_audio: str | None = None
 
         if _HAS_MEDIA:
             self._audio_output = QAudioOutput()
             self._player = QMediaPlayer()
             self._player.setAudioOutput(self._audio_output)
+            self._loop_audio_output = QAudioOutput()
+            self._loop_player = QMediaPlayer()
+            self._loop_player.setAudioOutput(self._loop_audio_output)
         else:
             self._player = None
             self._audio_output = None
+            self._loop_player = None
+            self._loop_audio_output = None
 
         self._build_ui()
         self._append_system(
@@ -75,7 +99,7 @@ class ChatPanel(QWidget):
         self.log.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(self.log, stretch=1)
 
-        # ── Audio bar (hidden until audio is available) ────────────────────────
+        # ── Fill audio bar (hidden until fill audio available) ─────────────────
         self._audio_bar = QWidget()
         audio_row = QHBoxLayout(self._audio_bar)
         audio_row.setContentsMargins(0, 0, 0, 0)
@@ -85,9 +109,9 @@ class ChatPanel(QWidget):
         self._lbl_audio.setStyleSheet("color:#6ac8ff; font-size:11px;")
         audio_row.addWidget(self._lbl_audio, stretch=1)
 
-        self._btn_play = QPushButton("▶ Play")
-        self._btn_play.setFixedWidth(72)
-        self._btn_play.clicked.connect(self._toggle_play)
+        self._btn_play = QPushButton("▶ Play Fill")
+        self._btn_play.setFixedWidth(84)
+        self._btn_play.clicked.connect(self._toggle_play_fill)
         audio_row.addWidget(self._btn_play)
 
         self._btn_open_folder = QPushButton("Open Folder")
@@ -102,6 +126,24 @@ class ChatPanel(QWidget):
 
         self._audio_bar.setVisible(False)
         layout.addWidget(self._audio_bar)
+
+        # ── Full loop bar (hidden until loop is built) ─────────────────────────
+        self._loop_bar = QWidget()
+        loop_row = QHBoxLayout(self._loop_bar)
+        loop_row.setContentsMargins(0, 0, 0, 0)
+        loop_row.setSpacing(6)
+
+        self._lbl_loop = QLabel("Building loop...")
+        self._lbl_loop.setStyleSheet("color:#00d4aa; font-size:11px;")
+        loop_row.addWidget(self._lbl_loop, stretch=1)
+
+        self._btn_play_loop = QPushButton("▶ Play Full Loop")
+        self._btn_play_loop.setFixedWidth(120)
+        self._btn_play_loop.clicked.connect(self._toggle_play_loop)
+        loop_row.addWidget(self._btn_play_loop)
+
+        self._loop_bar.setVisible(False)
+        layout.addWidget(self._loop_bar)
 
         # ── Command input row ──────────────────────────────────────────────────
         row = QHBoxLayout()
@@ -122,12 +164,13 @@ class ChatPanel(QWidget):
 
     def set_midi_path(self, path: str):
         self._midi_path = path
+        self._original_audio_path = path if Path(path).suffix.lower() in _AUDIO_EXTS else None
         self._append_system(f"Loaded: {Path(path).name}")
 
     def set_output_dir(self, output_dir: str):
         self.output_dir = output_dir
 
-    # ── audio controls ────────────────────────────────────────────────────────
+    # ── fill audio controls ───────────────────────────────────────────────────
 
     def _set_audio(self, audio_path: str | None):
         self._latest_audio = audio_path
@@ -137,51 +180,95 @@ class ChatPanel(QWidget):
 
         self._audio_bar.setVisible(True)
         self._lbl_audio.setText(Path(audio_path).name)
-        self._btn_play.setText("▶ Play")
+        self._btn_play.setText("▶ Play Fill")
 
         if self._player:
             self._player.setSource(QUrl.fromLocalFile(audio_path))
-
         if not _HAS_MEDIA:
             self._btn_play.setToolTip("PyQt6.QtMultimedia not installed — use Open Folder to play manually")
 
-    def _toggle_play(self):
+    def _toggle_play_fill(self):
         if not self._latest_audio:
             return
-
         if self._player:
             if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self._player.pause()
-                self._btn_play.setText("▶ Play")
+                self._btn_play.setText("▶ Play Fill")
             else:
                 self._player.play()
-                self._btn_play.setText("⏸ Pause")
+                self._btn_play.setText("⏸ Pause Fill")
         else:
-            # Fallback: open with system default player
             _open_with_system(self._latest_audio)
+
+    # ── full loop controls ────────────────────────────────────────────────────
+
+    def _set_full_loop(self, loop_path: str | None, label: str = "Original → Fill"):
+        self._full_loop_audio = loop_path
+        if not loop_path:
+            self._loop_bar.setVisible(False)
+            return
+
+        self._loop_bar.setVisible(True)
+        self._lbl_loop.setText(label)
+        self._btn_play_loop.setText("▶ Play Full Loop")
+
+        if self._loop_player:
+            self._loop_player.setSource(QUrl.fromLocalFile(loop_path))
+
+    def _toggle_play_loop(self):
+        if not self._full_loop_audio:
+            return
+        if self._loop_player:
+            if self._loop_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self._loop_player.pause()
+                self._btn_play_loop.setText("▶ Play Full Loop")
+            else:
+                self._loop_player.play()
+                self._btn_play_loop.setText("⏸ Pause Loop")
+        else:
+            _open_with_system(self._full_loop_audio)
+
+    def _start_loop_build(self, original: str, fill: str):
+        """Start ffmpeg concat in background. Shows loop bar when done."""
+        out_path = str(Path(self.output_dir) / "full_loop.wav")
+        self._loop_bar.setVisible(True)
+        self._lbl_loop.setText("Building full loop...")
+        self._btn_play_loop.setEnabled(False)
+
+        self._loop_worker = _LoopBuildWorker(original, fill, out_path)
+        self._loop_worker.done.connect(self._on_loop_built)
+        self._loop_worker.start()
+
+    def _on_loop_built(self, loop_path: str):
+        self._btn_play_loop.setEnabled(True)
+        if not loop_path:
+            self._loop_bar.setVisible(False)
+            return
+        orig_dur = _audio_duration_s(self._original_audio_path or "")
+        fill_dur = _audio_duration_s(self._latest_audio or "")
+        label = f"Original ({orig_dur}s) → Fill ({fill_dur}s)"
+        self._set_full_loop(loop_path, label)
+
+    # ── other audio controls ──────────────────────────────────────────────────
 
     def _open_audio_folder(self):
         target = self._latest_audio or (self.output_dir if self.output_dir else None)
         if not target:
             return
-        folder = str(Path(target).parent)
-        _open_with_system(folder)
+        _open_with_system(str(Path(target).parent))
 
     def _separate_stems(self):
         target = self._latest_audio or self._midi_path
         if not target:
             self._append_error("No audio loaded. Run /fill first to generate audio.")
             return
-
         path = Path(target)
-        audio_exts = {".wav", ".mp3", ".aiff", ".flac", ".ogg", ".m4a"}
-        if path.suffix.lower() not in audio_exts:
+        if path.suffix.lower() not in _AUDIO_EXTS:
             self._append_error(
                 f"Stem separation needs audio (WAV/MP3), not {path.suffix}.\n"
                 "Run /fill first — audio generates when DGX audio server is online."
             )
             return
-
         self._dispatch_stems(str(path))
 
     def _dispatch_stems(self, audio_path: str):
@@ -258,9 +345,11 @@ class ChatPanel(QWidget):
             self._append_aux(msg)
         elif rtype == "files":
             self._append_aux(msg)
-            # Update audio bar if audio was generated
             audio_path = result.get("audio_path")
             self._set_audio(audio_path)
+            # Build full loop if we have both original audio and fill audio
+            if audio_path and self._original_audio_path:
+                self._start_loop_build(self._original_audio_path, audio_path)
             files = result.get("files", [])
             if files:
                 self.files_ready.emit(files, self.output_dir)
@@ -317,6 +406,8 @@ class ChatPanel(QWidget):
         self.send_btn.setText("..." if busy else "Send")
 
 
+# ── module-level helpers ──────────────────────────────────────────────────────
+
 def _esc(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -332,3 +423,50 @@ def _open_with_system(path: str):
         subprocess.Popen(["explorer", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _concat_audio_ffmpeg(original: str, fill: str, output: str) -> str | None:
+    """
+    Concatenate two audio files end-to-end using ffmpeg.
+    Returns output path on success, None on any failure (including ffmpeg missing).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", original,
+                "-i", fill,
+                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+                output,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode == 0 and Path(output).exists():
+            return output
+        return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _audio_duration_s(path: str) -> str:
+    """Best-effort audio duration in seconds as a string."""
+    if not path or not Path(path).exists():
+        return "?"
+    # WAV: use stdlib wave
+    if path.lower().endswith(".wav"):
+        try:
+            import wave
+            with wave.open(path) as wf:
+                return str(round(wf.getnframes() / wf.getframerate(), 1))
+        except Exception:
+            pass
+    # Other formats: try mutagen (already a dependency)
+    try:
+        from mutagen import File as MutagenFile
+        f = MutagenFile(path)
+        if f and hasattr(f, "info"):
+            return str(round(f.info.length, 1))
+    except Exception:
+        pass
+    return "?"

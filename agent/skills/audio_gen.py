@@ -18,61 +18,71 @@ class AudioServerOfflineError(Exception):
     pass
 
 
-# Keyword → producer-grade descriptor. Checked in order; multiple can match.
+def _audio_server_error(resp: httpx.Response) -> str:
+    try:
+        detail = resp.json().get("detail")
+    except Exception:
+        detail = resp.text[:500]
+    return f"Audio server returned {resp.status_code}: {detail or resp.reason_phrase}"
+
+
+# keyword → specific instrument/texture descriptor (MusicGen responds to these)
 _STYLE_MAP: list[tuple[set[str], str]] = [
-    ({"trap", "drill"},         "trap drums, 808 sub bass, triplet hi-hats"),
-    ({"808"},                   "heavy 808 sub bass, trap drums"),
-    ({"lo-fi", "lofi", "lo fi"}, "lo-fi hip hop, jazzy piano, dusty drums, vinyl warmth"),
-    ({"dark"},                  "dark, moody, minor key atmosphere"),
-    ({"drake", "melodic"},      "melodic, emotional, atmospheric pads, vocal chops"),
-    ({"jazz", "jazzy"},         "jazz piano, walking bass, brushed drums"),
-    ({"house", "dance"},        "four-on-the-floor kick, punchy synth bass, dance music"),
-    ({"ambient", "atmospheric"}, "ambient textural pads, reverb wash, slow attack"),
-    ({"r&b", "rnb", "soul"},    "R&B, soulful smooth chords, vocal chops"),
-    ({"rage", "pluggnb"},       "pluggnb, icy bells, heavy bass, Atlanta"),
-    ({"boom bap", "boom-bap"},  "boom bap, sampled drums, punchy snare, NYC hip hop"),
+    ({"trap", "drill"},
+     "Roland TR-808 sub bass with long decay, triplet hi-hats, snare rolls, dark and brooding"),
+    ({"808"},
+     "Roland TR-808 pitch-sliding sub bass with long tail, deep chest-rattling low end"),
+    ({"lo-fi", "lofi", "lo fi"},
+     "Rhodes electric piano, vinyl crackle, dusty boom bap drums, warm tape saturation"),
+    ({"dark"},
+     "minor key, reverb-drenched, brooding atmosphere, sparse haunting notes"),
+    ({"drake", "melodic"},
+     "emotional piano melody, lush atmospheric pads, melodic and cinematic"),
+    ({"house", "dance"},
+     "four-on-the-floor kick, off-beat hi-hats, deep Chicago house organ"),
+    ({"ambient", "atmospheric"},
+     "evolving synth pads, slow attack, deep reverb wash, minimal percussion"),
+    ({"jazz", "jazzy"},
+     "walking upright bass, jazz chord voicings, brushed snare, swing groove"),
+    ({"boom bap", "boom-bap"},
+     "punchy sampled drums, crate-digging soul chops, NYC underground"),
+    ({"afrobeats", "afro"},
+     "talking drum, plucked kora, bouncy kick, bright synth stabs"),
+    ({"r&b", "rnb", "soul"},
+     "soulful Rhodes chords, warm bass guitar, soft brushed snare"),
+    ({"rage", "pluggnb"},
+     "icy tuned bells, heavy distorted 808, Atlanta melodic trap"),
 ]
 
-_ENERGY_DESCRIPTORS = {
-    "high":  "hard-hitting, high energy",
-    "mid":   "mid-tempo, groovy",
-    "low":   "mellow, soft, introspective",
+_ENERGY_RHYTHM: dict[str, str] = {
+    "high": "hard-hitting drums, punchy transients, driving rhythm",
+    "mid":  "mid-tempo groove, balanced dynamics",
+    "low":  "slow laid-back feel, soft dynamics, spacious mix",
 }
 
 
 def build_musicgen_prompt(analysis: dict, prompt: str | None = None) -> str:
     key = analysis.get("key", "C major")
     tempo = int(analysis.get("tempo") or 120)
-    energy = analysis.get("energy", 0.5)
+    energy = float(analysis.get("energy") or 0.5)
 
-    # Energy tier
-    if energy > 0.7:
-        energy_desc = _ENERGY_DESCRIPTORS["high"]
-    elif energy < 0.3:
-        energy_desc = _ENERGY_DESCRIPTORS["low"]
-    else:
-        energy_desc = _ENERGY_DESCRIPTORS["mid"]
+    energy_tier = "high" if energy > 0.7 else ("low" if energy < 0.3 else "mid")
+    rhythm_desc = _ENERGY_RHYTHM[energy_tier]
 
-    # Match style keywords against prompt (case-insensitive)
     raw = (prompt or "").lower()
-    genre_tags: list[str] = []
+    # Deduplicate: use dict to preserve insertion order, last-wins per keyword group
+    seen_descriptors: dict[str, bool] = {}
     for keywords, descriptor in _STYLE_MAP:
-        if any(kw in raw for kw in keywords):
-            genre_tags.append(descriptor)
+        if any(kw in raw for kw in keywords) and descriptor not in seen_descriptors:
+            seen_descriptors[descriptor] = True
 
-    parts: list[str] = []
-
-    if genre_tags:
-        parts.extend(genre_tags)
-        parts.append(energy_desc)
-    else:
-        # No keywords — lead with energy + generic beat descriptor
-        parts.append(f"{energy_desc} beat")
-
-    parts.append(key)
+    parts: list[str] = list(seen_descriptors.keys()) if seen_descriptors else []
+    parts.append(rhythm_desc)
+    parts.append(f"{key} key")
     parts.append(f"{tempo} BPM")
+    parts.append("professional studio mix, high fidelity audio")
 
-    # Append any free-text from the user verbatim at the end
+    # Append user free-text last for any extra nuance
     if prompt:
         parts.append(prompt)
 
@@ -116,6 +126,8 @@ def generate_audio_continuation(
         resp.raise_for_status()
     except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
         raise AudioServerOfflineError(f"Audio server unreachable: {e}") from e
+    except httpx.HTTPStatusError as e:
+        raise AudioServerOfflineError(_audio_server_error(e.response)) from e
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_bytes(resp.content)
@@ -135,10 +147,12 @@ def separate_stems(audio_path: str, output_dir: str) -> dict[str, str]:
                 f"{AUDIO_SERVER_URL}/stems",
                 files={"file": (Path(audio_path).name, f, "audio/wav")},
                 timeout=300.0,
-            )
+        )
         resp.raise_for_status()
     except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout) as e:
         raise AudioServerOfflineError(f"Audio server unreachable: {e}") from e
+    except httpx.HTTPStatusError as e:
+        raise AudioServerOfflineError(_audio_server_error(e.response)) from e
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

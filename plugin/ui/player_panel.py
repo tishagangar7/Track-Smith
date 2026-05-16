@@ -3,6 +3,8 @@ In-app media playback: MP3/WAV via QMediaPlayer, MIDI via FluidSynth.
 Seek, A/B compare (Original vs With Fill), combined preview.
 """
 
+from __future__ import annotations
+
 import time
 from pathlib import Path
 
@@ -14,7 +16,14 @@ from PyQt6.QtWidgets import (
     QPushButton, QSlider, QLabel, QComboBox, QButtonGroup,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QUrl, QTimer
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    _HAS_QTMULTIMEDIA = True
+except ImportError:
+    QMediaPlayer = None
+    QAudioOutput = None
+    _HAS_QTMULTIMEDIA = False
 
 from plugin.media_info import count_midi_notes, bpm_from_midi
 from plugin.midi_merge import merge_input_and_continuation
@@ -497,6 +506,9 @@ class PlayerPanel(QWidget):
         self, path: str, volume: float, target_bpm: float, file_bpm: float,
         combined_total: float | None = None, start_sec: float = 0.0,
     ):
+        if not _HAS_QTMULTIMEDIA:
+            self.time_label.setText("Audio playback unavailable: reinstall PyQt6")
+            return
         self._stop_worker(keep_sequential=True)
         self._fill_after_audio = combined_total is not None
         self._fill_started = False

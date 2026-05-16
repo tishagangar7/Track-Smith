@@ -17,6 +17,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -25,8 +26,6 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Aux Audio Server", version="1.0.0")
 
-_MUSICGEN_SAMPLE_RATE = 32000  # MusicgenMelody expected input rate
-
 _musicgen = None
 _processor = None
 
@@ -34,11 +33,10 @@ _processor = None
 def _load_musicgen():
     global _musicgen, _processor
     if _musicgen is None:
-        from transformers import AutoProcessor, MusicgenMelodyForConditionalGeneration
-        # musicgen-melody supports both text-only and melody-conditioned generation
-        model_name = os.getenv("MUSICGEN_MODEL", "facebook/musicgen-melody")
+        from transformers import AutoProcessor, MusicgenForConditionalGeneration
+        model_name = os.getenv("MODEL_NAME", "facebook/musicgen-small")
         _processor = AutoProcessor.from_pretrained(model_name)
-        _musicgen = MusicgenMelodyForConditionalGeneration.from_pretrained(model_name)
+        _musicgen = MusicgenForConditionalGeneration.from_pretrained(model_name)
         if torch.cuda.is_available():
             _musicgen = _musicgen.cuda()
     return _musicgen, _processor
@@ -58,57 +56,29 @@ def health():
 @app.post("/generate")
 def generate(req: GenerateRequest):
     try:
-        import base64
         import scipy.io.wavfile as wav
-        import torchaudio
 
         model, processor = _load_musicgen()
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        max_new_tokens = req.duration * 50  # ~50 tokens/sec
 
-        if req.reference_audio_b64:
-            # Melody-conditioned generation
-            raw_bytes = base64.b64decode(req.reference_audio_b64)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(raw_bytes)
-                tmp_path = tmp.name
+        inputs = processor(
+            text=[req.prompt],
+            padding=True,
+            return_tensors="pt",
+        ).to(device)
 
-            try:
-                waveform, sample_rate = torchaudio.load(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-
-            # Convert to mono, resample to MusicGen's expected rate
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            if sample_rate != _MUSICGEN_SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(sample_rate, _MUSICGEN_SAMPLE_RATE)
-                waveform = resampler(waveform)
-
-            audio_np = waveform.squeeze(0).numpy()
-            inputs = processor(
-                audio=[audio_np],
-                sampling_rate=_MUSICGEN_SAMPLE_RATE,
-                text=[req.prompt],
-                padding=True,
-                return_tensors="pt",
-            ).to(device)
-        else:
-            # Text-only generation
-            inputs = processor(
-                text=[req.prompt],
-                padding=True,
-                return_tensors="pt",
-            ).to(device)
-
+        max_new_tokens = int(os.getenv("AUDIO_MAX_TOKENS", "1024"))
         with torch.no_grad():
             audio_values = model.generate(**inputs, max_new_tokens=max_new_tokens)
 
-        audio_np = audio_values[0, 0].cpu().numpy()
-        sample_rate = model.config.audio_encoder.sampling_rate
+        audio = audio_values[0, 0].cpu().numpy().astype(np.float32)
+        if np.abs(audio).max() > 0:
+            audio = audio / np.abs(audio).max()
+        audio_int16 = (audio * 32767).astype(np.int16)
 
+        sample_rate = model.config.audio_encoder.sampling_rate
         buf = io.BytesIO()
-        wav.write(buf, sample_rate, (audio_np * 32767).astype("int16"))
+        wav.write(buf, sample_rate, audio_int16)
         buf.seek(0)
 
         return Response(content=buf.read(), media_type="audio/wav")

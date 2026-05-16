@@ -69,6 +69,31 @@ _BASS_PATTERNS  = {"sub_root", "808_glide", "walking", "syncopated"}
 _LEAD_MOTIFS    = {"ascending", "descending", "call_response", "static"}
 _FX_TYPES       = {"riser", "atmospheric_pad", "noise_sweep", "none"}
 
+# ── Contrasting fallback plans (genre + pattern combos guaranteed distinct) ────
+_CONTRAST_SWAPS = [
+    {
+        "genre": "lo-fi", "mood": "melancholic", "vibe": "chill lo-fi loop",
+        "description": "Lo-fi boom bap with jazzy walking bass",
+        "drum_pattern": "boom_bap", "bass_pattern": "walking",
+        "lead_motif": "call_response", "fx_type": "none",
+        "pad_intensity": 0.7, "lead_density": 0.3, "perc_intensity": 0.4,
+    },
+    {
+        "genre": "ambient", "mood": "ethereal", "vibe": "ambient atmosphere",
+        "description": "Evolving ambient pad with riser and sparse broken rhythm",
+        "drum_pattern": "broken", "bass_pattern": "sub_root",
+        "lead_motif": "ascending", "fx_type": "atmospheric_pad",
+        "pad_intensity": 0.9, "lead_density": 0.2, "perc_intensity": 0.1,
+    },
+    {
+        "genre": "house", "mood": "uplifting", "vibe": "deep house groove",
+        "description": "Four-on-the-floor house with syncopated bass and chords",
+        "drum_pattern": "four_on_floor", "bass_pattern": "syncopated",
+        "lead_motif": "static", "fx_type": "riser",
+        "pad_intensity": 0.5, "lead_density": 0.5, "perc_intensity": 0.6,
+    },
+]
+
 
 # ── Scale / note helpers ──────────────────────────────────────────────────────
 
@@ -253,10 +278,7 @@ def reason_with_nemotron(analysis: dict, artist_prompt: str = None) -> list:
     Returns list of 3 plan dicts. Each plan is rendered by the MIDI engine.
     Nemotron NEVER generates raw notes — only genre/mood/pattern decisions.
     """
-    if STUB_MODE:
-        logger.info("STUB_MODE: using fallback plans")
-        return _fallback_plans(analysis, artist_prompt)
-
+    # Compute shared context first so sanitize/uniqueness can use it in both paths
     key = analysis.get("key", "A minor")
     tempo = float(analysis.get("tempo", 120))
     energy = float(analysis.get("energy", 0.5))
@@ -265,20 +287,24 @@ def reason_with_nemotron(analysis: dict, artist_prompt: str = None) -> list:
         chords = chords + chords
     chords = chords[:4]
 
-    energy_label = "low" if energy < 0.4 else ("high" if energy > 0.7 else "medium")
-    artist_ctx = f'\nArtist direction: "{artist_prompt}"' if artist_prompt else ""
+    if STUB_MODE:
+        logger.info("STUB_MODE: using fallback plans")
+        result = _fallback_plans(analysis, artist_prompt)
+    else:
+        energy_label = "low" if energy < 0.4 else ("high" if energy > 0.7 else "medium")
+        artist_ctx = f'\nArtist direction: "{artist_prompt}"' if artist_prompt else ""
 
-    system_prompt = (
-        "You are a music producer's AI assistant. "
-        "Given an analysis of an input track, decide the genre, mood, "
-        "and intensity of each instrument layer. "
-        "Output ONLY the structured JSON — never raw notes. "
-        "The MIDI engine handles all note generation deterministically. "
-        "/no_think\n"
-        "Respond with ONLY valid JSON array. No markdown fences."
-    )
+        system_prompt = (
+            "You are a music producer's AI assistant. "
+            "Given an analysis of an input track, decide the genre, mood, "
+            "and intensity of each instrument layer. "
+            "Output ONLY the structured JSON — never raw notes. "
+            "The MIDI engine handles all note generation deterministically. "
+            "/no_think\n"
+            "Respond with ONLY valid JSON array. No markdown fences."
+        )
 
-    few_shot = """\
+        few_shot = """\
 EXAMPLE (A minor, 90 BPM, energy=0.45):
 [
   {
@@ -305,9 +331,9 @@ EXAMPLE (A minor, 90 BPM, energy=0.45):
 ]
 END EXAMPLE"""
 
-    ctx = _format_analysis_context(analysis)
+        ctx = _format_analysis_context(analysis)
 
-    prompt = f"""\
+        prompt = f"""\
 Analyze this track and return 3 distinct producer loop plans.
 
 TRACK ANALYSIS:
@@ -322,6 +348,13 @@ Rules:
 - lead_motif: ascending | descending | call_response | static
 - fx_type: riser | atmospheric_pad | noise_sweep | none
 - Each option must be a DIFFERENT genre/mood
+
+DIVERSITY REQUIREMENT — this is critical:
+Generate exactly 3 MUSICALLY DISTINCT options. They MUST differ meaningfully:
+- Option 1: faithful to the original style and energy level
+- Option 2: contrast — significantly higher or lower energy, or a different feel entirely
+- Option 3: unexpected — genre blend or mood shift the producer would not expect
+If all 3 share the same genre and drum_pattern you have failed the task.
 
 {few_shot}
 
@@ -343,21 +376,21 @@ Generate 3 plans for THIS track. Respond ONLY with a valid JSON array of 3 objec
   }}
 ]"""
 
-    if DEBUG:
-        logger.debug("=== Nemotron PROMPT ===\n%s\n=== END PROMPT ===", prompt)
+        if DEBUG:
+            logger.debug("=== Nemotron PROMPT ===\n%s\n=== END PROMPT ===", prompt)
 
-    result = chat_json_array(
-        prompt,
-        task="main",
-        max_tokens=NEMOTRON_MAX_TOKENS,
-        temperature=NEMOTRON_TEMPERATURE,
-        system_prompt=system_prompt,
-    )
+        result = chat_json_array(
+            prompt,
+            task="main",
+            max_tokens=NEMOTRON_MAX_TOKENS,
+            temperature=0.9,
+            system_prompt=system_prompt,
+        )
 
-    if DEBUG:
-        logger.debug("=== Nemotron RAW RESPONSE ===\n%s\n=== END RESPONSE ===", result)
+        if DEBUG:
+            logger.debug("=== Nemotron RAW RESPONSE ===\n%s\n=== END RESPONSE ===", result)
 
-    # Sanitize fields
+    # Sanitize fields — runs for both STUB_MODE and live paths
     for plan in result:
         plan.setdefault("bars", 8)
         plan.setdefault("chord_progression", chords)
@@ -372,6 +405,24 @@ Generate 3 plans for THIS track. Respond ONLY with a valid JSON array of 3 objec
         plan["lead_density"]  = float(np.clip(plan.get("lead_density",  0.3), 0.0, 1.0))
         plan["pad_intensity"]  = float(np.clip(plan.get("pad_intensity",  0.5), 0.0, 1.0))
         plan["perc_intensity"] = float(np.clip(plan.get("perc_intensity", 0.3), 0.0, 1.0))
+
+    # Uniqueness check: if 2+ options share identical (genre, drum_pattern), swap duplicates
+    seen_pairs: dict[tuple, int] = {}
+    for i, plan in enumerate(result):
+        pair = (plan.get("genre", ""), plan.get("drum_pattern", ""))
+        if pair in seen_pairs:
+            used_genres = {p.get("genre", "") for j, p in enumerate(result) if j != i}
+            swap = next(
+                (s for s in _CONTRAST_SWAPS if s["genre"] not in used_genres),
+                _CONTRAST_SWAPS[i % len(_CONTRAST_SWAPS)],
+            )
+            plan.update(swap)
+            logger.info(
+                "Uniqueness fix: option %d swapped to %s/%s",
+                i + 1, swap["genre"], swap["drum_pattern"],
+            )
+        else:
+            seen_pairs[pair] = i
 
     return result
 
