@@ -73,7 +73,8 @@ class MIDIDropHandler(FileSystemEventHandler):
                 logger.info(f"Analysis: {analysis}")
 
                 result = generate_continuations(
-                    analysis, output_dir=OUTPUT_FOLDER, prompt=prompt, mode=mode
+                    analysis, output_dir=OUTPUT_FOLDER, prompt=prompt, mode=mode,
+                    original_midi_path=filepath,
                 )
 
                 if self.dj and mode == "full":

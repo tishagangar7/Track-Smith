@@ -23,11 +23,12 @@ def route(raw: str, midi_path: str | None, style_context: str | None, output_dir
             "type": "text",
             "message": (
                 "Commands:\n"
-                "  /fill           — generate MIDI continuation from loaded file\n"
+                "  /fill           — generate audio + MIDI continuation from loaded file\n"
                 "  /vibe <text>    — compose from a text description\n"
                 "  /suggest        — get 3 text ideas (no MIDI)\n"
                 "  /analyze        — read key, tempo, energy, chords\n"
                 "  /mix            — generate a complementary stem\n"
+                "  /stems          — separate loaded audio into drum/bass/vocals/other\n"
                 "  /style <artist> — nudge generation toward an artist reference\n"
                 "  /help           — show this"
             ),
@@ -37,7 +38,7 @@ def route(raw: str, midi_path: str | None, style_context: str | None, output_dir
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
 
-    from plugin.commands import analyze, vibe, suggest, fill, style, mix
+    from plugin.commands import analyze, vibe, suggest, fill, style, mix, stems
 
     if cmd == "/analyze":
         if not midi_path:
@@ -55,6 +56,10 @@ def route(raw: str, midi_path: str | None, style_context: str | None, output_dir
 
     elif cmd == "/mix":
         return mix.run(midi_path, prompt=args or None, style_context=style_context, output_dir=output_dir)
+
+    elif cmd == "/stems":
+        target = midi_path  # uses loaded file; audio_path override handled in chat_panel
+        return stems.run(target, output_dir=output_dir)
 
     elif cmd == "/style":
         result = style.run(args)

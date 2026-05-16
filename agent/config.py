@@ -16,7 +16,7 @@ load_dotenv()
 
 # ── NVIDIA / Nemotron ─────────────────────────────────────────────────────────
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_BASE_URL = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1")
 
 # Hackathon Nemotron models (override in .env if needed)
 NEMOTRON_MODEL_FAST = os.getenv(
@@ -31,6 +31,10 @@ NEMOTRON_MODEL_MAIN = os.getenv(
 NEMOTRON_MODEL = os.getenv("NEMOTRON_MODEL", NEMOTRON_MODEL_MAIN)
 
 NEMOTRON_TIMEOUT = int(os.getenv("NEMOTRON_TIMEOUT", "120"))
+
+# ── Audio / MusicGen ──────────────────────────────────────────────────────────
+AUDIO_SERVER_URL = os.getenv("AUDIO_SERVER_URL", "")   # e.g. http://100.77.70.20:8001
+AUDIO_DURATION = int(os.getenv("AUDIO_DURATION", "8"))  # seconds
 NEMOTRON_MAX_TOKENS = int(os.getenv("NEMOTRON_MAX_TOKENS", "1500"))
 NEMOTRON_TEMPERATURE = float(os.getenv("NEMOTRON_TEMPERATURE", "0.6"))
 
