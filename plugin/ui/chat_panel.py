@@ -34,6 +34,8 @@ def _h(text: str) -> str:
     return _html.escape(str(text)).replace("\n", "<br>")
 
 
+# ── style chip bar ────────────────────────────────────────────────────────────
+
 # ── vinyl icon widget ─────────────────────────────────────────────────────────
 
 class _VinylIcon(QWidget):
