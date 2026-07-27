@@ -6,6 +6,8 @@ TrackSmith is an agentic AI music production assistant that lives inside a produ
 
 Built for independent creators who deserve the same creative feedback loop that professional producers already have.
 
+📺 **[Watch the demo](https://youtu.be/F5ipd75NgdQ?si=OTutkrDEMxhYpXqM)**
+
 ---
 
 ## What it does
